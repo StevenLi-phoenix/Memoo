@@ -88,7 +88,7 @@ class TelegramChannel:
             if self._handler is None:
                 return
             response = await self._handler(chat_id, user_text, metadata)
-            if response.strip() != "NO_OP":
+            if response.strip():
                 await self.send(chat_id, response)
         except Exception:
             logger.exception("Error handling message from chat_id=%s", chat_id)

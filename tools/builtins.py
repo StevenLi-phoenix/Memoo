@@ -22,7 +22,7 @@ from core.tools import ToolRegistry
 logger = logging.getLogger(__name__)
 
 MAX_OUTPUT = 10000
-EXEC_TIMEOUT = 30
+DEFAULT_EXEC_TIMEOUT = 300  # 5 min default, agent can override per-call
 
 # macOS sandbox-exec profile (SBPL):
 # - Read: anywhere (system libs, binaries, data)
@@ -136,7 +136,7 @@ def register(registry: ToolRegistry, **deps: Any) -> None:
         return session_dir
 
     @registry.tool
-    async def run_code(code: str, language: str = "python") -> str:
+    async def run_code(code: str, language: str = "python", timeout: int = 0) -> str:
         """Execute code in an OS-level sandbox. Full power inside, no write access outside.
 
         Each session has its own isolated directory — files persist across calls.
@@ -144,6 +144,7 @@ def register(registry: ToolRegistry, **deps: Any) -> None:
         Args:
             code: The code to execute.
             language: Programming language (python, bash).
+            timeout: Max execution time in seconds. 0 uses default (from config).
         """
         if language not in ("python", "bash"):
             return f"Unsupported language: {language}. Supported: python, bash"
@@ -151,20 +152,25 @@ def register(registry: ToolRegistry, **deps: Any) -> None:
         session_dir = _get_session_dir()
         profile = _make_profile(session_dir)
 
-        logger.info("run_code: lang=%s, session_dir=%s, len=%d", language, session_dir, len(code))
+        exec_timeout = timeout if timeout > 0 else DEFAULT_EXEC_TIMEOUT
+        logger.info(
+            "run_code: lang=%s, session_dir=%s, timeout=%ds, len=%d", language, session_dir, exec_timeout, len(code)
+        )
 
         if language == "python":
             return await _run_sandboxed(
                 ["sandbox-exec", "-p", profile, "python3", "-u", "-c", code],
                 session_dir,
+                exec_timeout,
             )
         else:
             return await _run_sandboxed(
                 ["sandbox-exec", "-p", profile, "bash", "-c", f"set -euo pipefail\n{code}"],
                 session_dir,
+                exec_timeout,
             )
 
-    async def _run_sandboxed(cmd: list[str], exec_dir: str) -> str:
+    async def _run_sandboxed(cmd: list[str], exec_dir: str, timeout_s: int = DEFAULT_EXEC_TIMEOUT) -> str:
         """Execute a command inside sandbox-exec."""
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -174,7 +180,7 @@ def register(registry: ToolRegistry, **deps: Any) -> None:
                 cwd=exec_dir,
                 env=_safe_env(exec_dir),
             )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=EXEC_TIMEOUT)
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
             output = stdout.decode(errors="replace")
             if stderr:
                 err_text = stderr.decode(errors="replace")
@@ -183,7 +189,7 @@ def register(registry: ToolRegistry, **deps: Any) -> None:
             return _truncate(output) or "(no output)"
         except asyncio.TimeoutError:
             proc.kill()  # type: ignore[possibly-undefined]
-            return f"Error: timed out ({EXEC_TIMEOUT}s)"
+            return f"Error: timed out ({timeout_s}s)"
         except Exception as e:
             return f"Error: {e}"
 

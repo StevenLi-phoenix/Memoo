@@ -14,13 +14,14 @@ import sys
 from pathlib import Path
 from typing import Any
 
-import yaml
 from dotenv import load_dotenv
 
 from channels import create_channel
-from core.agent import NO_OP, Agent, TurnResult
+from core.agent import Agent, TurnResult
+from core.config import AppConfig
 from core.crash import crash_boundary
 from core.crash import init as init_crash_handler
+from core.gateway import Gateway
 from core.heartbeat import Heartbeat
 from core.hooks import HookRegistry, rate_limit_hook, sandbox_path_hook
 from core.memory import Memory
@@ -38,22 +39,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("memoo")
 
-# Initialize crash handler — logs to .logs/, queues for auto-fix
-init_crash_handler(
-    logs_dir=".logs",
-    webhook_url=os.environ.get("MEMOO_CRASH_WEBHOOK", ""),
-)
-
-
-def _is_noop(response: str) -> bool:
-    return response.strip() == NO_OP
-
-
-def load_config(path: str = "config.yaml") -> dict[str, Any]:
-    with open(path, encoding="utf-8") as f:
-        config: dict[str, Any] = yaml.safe_load(f)
-    logger.info("Config loaded from %s", path)
-    return config
+init_crash_handler(logs_dir=".logs", webhook_url=os.environ.get("MEMOO_CRASH_WEBHOOK", ""))
 
 
 def load_system_prompt(prompt_path: str) -> str:
@@ -81,148 +67,114 @@ def _get_api_key(provider_type: str) -> str:
 
 
 async def _discover_and_cache(provider_type: str, provider: Any, cache: ModelCache) -> list[ModelInfo]:
-    """Discover models from provider, using cache if fresh."""
     cached = cache.get(provider_type)
     if cached:
         logger.debug("%s: using %d cached models", provider_type, len(cached))
         return cached
-
     if isinstance(provider, DiscoverableProvider):
         models = await provider.discover_models()
         if models:
             cache.put(provider_type, models)
             return models
-
     logger.warning("%s: no models discovered", provider_type)
     return []
 
 
 def _pick_model(models: list[ModelInfo], preference: str = "") -> str | None:
-    """Pick the best model from discovered list.
-
-    If preference is set, try exact match first.
-    Otherwise pick the newest model.
-    """
     if not models:
         return None
-
     if preference:
-        # Exact match
         for m in models:
             if m.id == preference:
                 return m.id
-        # Substring match
         for m in models:
             if preference in m.id:
                 return m.id
-
-    # Default: newest by created timestamp
     by_created = sorted(models, key=lambda m: m.created, reverse=True)
     return by_created[0].id
 
 
 async def build_llm_registry(
-    llm_config: dict[str, Any], tools_config: dict[str, Any]
+    cfg: AppConfig,
 ) -> tuple[LLMProvider, list[LLMProvider], dict[str, list[ModelInfo]]]:
-    """Build LLM providers with model discovery.
-
-    Returns (default_provider, fallback_chain, discovered_models_by_provider).
-    """
-    web_search = tools_config.get("web_search", True)
+    """Build LLM providers with model discovery from AppConfig."""
+    web_search = cfg.tools.web_search
     cache = ModelCache()
-    providers_conf: list[dict[str, Any]] = llm_config.get("providers", [])
-    default_provider_name = llm_config.get("default", "")
-    fallback_names: list[str] = llm_config.get("fallback", [])
 
     built: dict[str, LLMProvider] = {}
     all_discovered: dict[str, list[ModelInfo]] = {}
 
-    for p_conf in providers_conf:
-        p_type = p_conf["provider"] if isinstance(p_conf, dict) else p_conf
-        p_name = p_conf.get("name", p_type) if isinstance(p_conf, dict) else p_conf
-        preference = p_conf.get("model", "") if isinstance(p_conf, dict) else ""
-
+    for p_conf in cfg.llm.providers:
         try:
-            api_key = _get_api_key(p_type)
+            api_key = _get_api_key(p_conf.provider)
         except ValueError as e:
-            logger.warning("Skipping %s: %s", p_name, e)
+            logger.warning("Skipping %s: %s", p_conf.name, e)
             continue
 
-        # Create provider without model (for discovery)
         kwargs: dict[str, Any] = {"api_key": api_key}
-        if p_type == "anthropic":
+        if p_conf.provider == "anthropic":
             kwargs["web_search"] = web_search
-        provider = create_provider(p_type, **kwargs)
+        provider = create_provider(p_conf.provider, **kwargs)
 
-        # Discover models
-        models = await _discover_and_cache(p_type, provider, cache)
-        all_discovered[p_name] = models
+        models = await _discover_and_cache(p_conf.provider, provider, cache)
+        all_discovered[p_conf.name] = models
 
-        # Pick executor model
-        model_id = _pick_model(models, preference)
+        model_id = _pick_model(models, p_conf.model)
         if not model_id:
-            logger.warning("No models available for %s, skipping", p_name)
+            logger.warning("No models available for %s, skipping", p_conf.name)
             continue
 
-        # Set the chosen model
         provider.model_name = model_id  # type: ignore[union-attr]
 
-        # Resolve advisor model from discovered models (Anthropic only)
-        if p_type == "anthropic":
-            advisor_pref = p_conf.get("advisor", "") if isinstance(p_conf, dict) else ""
-            if advisor_pref:
-                advisor_id = _pick_model(models, advisor_pref)
-                if advisor_id and advisor_id != model_id:
-                    provider._advisor_model = advisor_id  # type: ignore[union-attr]
-                    logger.info("%s: advisor model %s", p_name, advisor_id)
-                else:
-                    logger.warning("%s: advisor model '%s' not found or same as executor", p_name, advisor_pref)
+        if p_conf.provider == "anthropic" and p_conf.advisor:
+            advisor_id = _pick_model(models, p_conf.advisor)
+            if advisor_id and advisor_id != model_id:
+                provider._advisor_model = advisor_id  # type: ignore[union-attr]
+                logger.info("%s: advisor model %s", p_conf.name, advisor_id)
 
-        built[p_name] = provider
-        logger.info("%s: selected model %s (from %d available)", p_name, model_id, len(models))
+        built[p_conf.name] = provider
+        logger.info("%s: selected model %s (from %d available)", p_conf.name, model_id, len(models))
 
     if not built:
         logger.error("No LLM providers available")
         sys.exit(1)
 
-    # Resolve default
-    if default_provider_name not in built:
-        default_provider_name = next(iter(built))
+    default_name = cfg.llm.default
+    if default_name not in built:
+        default_name = next(iter(built))
 
-    default_llm = built[default_provider_name]
-    fallback_chain = [built[n] for n in fallback_names if n in built and n != default_provider_name]
+    default_llm = built[default_name]
+    fallback_chain = [built[n] for n in cfg.llm.fallback if n in built and n != default_name]
 
-    logger.info(
-        "LLM: default=%s (%s), fallbacks=%d", default_provider_name, default_llm.model_name, len(fallback_chain)
-    )
+    logger.info("LLM: default=%s (%s), fallbacks=%d", default_name, default_llm.model_name, len(fallback_chain))
     return default_llm, fallback_chain, all_discovered
 
 
 class Memoo:
     """Main application orchestrator. Agent is the central hub."""
 
-    def __init__(self, config: dict[str, Any]) -> None:
-        self.config = config
+    def __init__(self, cfg: AppConfig) -> None:
+        self.cfg = cfg
         self.llm: LLMProvider | None = None
         self.fallback_llms: list[LLMProvider] = []
         self.discovered_models: dict[str, list[ModelInfo]] = {}
 
-        mem_config = config.get("memory", {})
         self.memory = Memory(
-            db_path=mem_config.get("db_path", "./data/memory.db"),
-            max_context=mem_config.get("max_context_messages", 200),
-            token_window=mem_config.get("token_window", 100_000),
+            db_path=cfg.memory.db_path,
+            max_context=cfg.memory.max_context_messages,
+            token_window=cfg.memory.token_window,
         )
 
-        db_dir = str(Path(mem_config.get("db_path", "./data/memory.db")).parent)
+        db_dir = str(Path(cfg.memory.db_path).parent)
         self.scheduler = Scheduler(db_path=str(Path(db_dir) / "schedules.db"))
 
         self.heartbeat = Heartbeat(heartbeat_dir="./heartbeat")
+        self.gateway = Gateway(host=cfg.host, port=cfg.port)
         self.tools = ToolRegistry()
         self.hooks = HookRegistry()
         self.hooks.add_hook(sandbox_path_hook)
         self.hooks.add_hook(rate_limit_hook)
-        self.hooks.allow("current_time", "list_schedules", "list_memories")
+        self.hooks.allow("current_time", "list_schedules", "list_memories", "get_config")
 
         self.agent: Agent | None = None
         self.channels: list[Any] = []
@@ -231,49 +183,56 @@ class Memoo:
         self._current_topics: dict[str, str] = {}
 
     async def start(self) -> None:
-        # Discover models and build LLM providers
-        llm_config = self.config.get("llm", {})
-        tools_config = self.config.get("tools", {})
-        self.llm, self.fallback_llms, self.discovered_models = await build_llm_registry(llm_config, tools_config)
+        self.llm, self.fallback_llms, self.discovered_models = await build_llm_registry(self.cfg)
 
-        # Build agent
-        prompt_path = self.config.get("agent", {}).get("system_prompt", "systemprompt/default.md")
-        system_prompt = load_system_prompt(prompt_path)
-        max_rounds = self.config.get("agent", {}).get("max_tool_rounds", 0)
+        await self.memory.init()
+        await self.scheduler.init()
+
+        # Discover skills and inject metadata into system prompt
+        from core.skills import SkillRegistry
+
+        self.skill_registry = SkillRegistry(skills_dir=Path("skills"))
+        self.skill_registry.discover()
+
+        system_prompt = load_system_prompt(self.cfg.agent.system_prompt)
+        skills_section = self.skill_registry.build_system_prompt_section()
+        if skills_section:
+            system_prompt += "\n" + skills_section
 
         self.agent = Agent(
             llm=self.llm,
             tools=self.tools,
             system_prompt=system_prompt,
-            max_rounds=max_rounds,
+            max_rounds=self.cfg.agent.max_tool_rounds,
             fallback_llms=self.fallback_llms,
             hooks=self.hooks,
+            memory=self.memory,
         )
 
-        await self.memory.init()
-        await self.scheduler.init()
-
-        # Auto-discover tools
         auto_discover_tools(
-            self.tools, deps={"memory": self.memory, "scheduler": self.scheduler, "sandbox_dir": "./sandbox"}
+            self.tools,
+            deps={
+                "memory": self.memory,
+                "scheduler": self.scheduler,
+                "sandbox_dir": "./sandbox",
+                "config": self.cfg,
+                "skill_registry": self.skill_registry,
+            },
         )
 
-        # Channels (fallback to TUI)
-        await self._start_channels(self.config.get("channels", {}))
-        if not self.channels:
-            logger.info("No remote channels started, falling back to TUI")
-            tui = create_channel("tui")
-            await tui.start(self.handle_message)
-            self.channels.append(tui)
-            self._channel_map["tui"] = tui
+        # Start gateway (TCP API for TUI and external clients)
+        await self.gateway.start(self.handle_message)
+
+        # Start messaging channels
+        await self._start_channels()
 
         await self.scheduler.start(self._handle_scheduled)
         await self.heartbeat.start(self._handle_heartbeat)
         logger.info("Memoo is running. Press Ctrl+C to stop.")
 
-    async def _start_channels(self, channels_config: dict[str, Any]) -> None:
-        for channel_type, ch_config in channels_config.items():
-            if not isinstance(ch_config, dict) or not ch_config.get("enabled", False):
+    async def _start_channels(self) -> None:
+        for channel_type, ch_config in self.cfg.channels.items():
+            if not ch_config.enabled:
                 continue
             try:
                 kwargs = self._resolve_channel_kwargs(channel_type, ch_config)
@@ -286,13 +245,13 @@ class Memoo:
                 logger.warning("Skipping channel %s: %s", channel_type, e)
 
     @staticmethod
-    def _resolve_channel_kwargs(channel_type: str, ch_config: dict[str, Any]) -> dict[str, Any]:
+    def _resolve_channel_kwargs(channel_type: str, ch_config: Any) -> dict[str, Any]:
         env_prefix = channel_type.upper()
         if channel_type == "telegram":
             token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
             if not token:
                 raise ValueError("TELEGRAM_BOT_TOKEN not set")
-            return {"token": token, "mode": ch_config.get("mode", "polling")}
+            return {"token": token, "mode": ch_config.mode}
         elif channel_type == "wechat":
             token = os.environ.get("WECHAT_ILINK_TOKEN", "")
             if not token:
@@ -303,7 +262,6 @@ class Memoo:
             kwargs: dict[str, Any] = {}
             if token:
                 kwargs["token"] = token
-            kwargs.update({k: v for k, v in ch_config.items() if k != "enabled"})
             return kwargs
 
     @crash_boundary("Memoo.handle_message")
@@ -311,11 +269,10 @@ class Memoo:
         if self.agent is None or self.llm is None:
             return "Error: Memoo not initialized"
 
-        # Truncate excessively long messages
         MAX_MSG_LEN = 50_000
         if len(text) > MAX_MSG_LEN:
             text = text[:MAX_MSG_LEN] + "\n...(truncated)"
-            logger.warning("Message from chat_id=%s truncated: %d -> %d chars", chat_id, len(text), MAX_MSG_LEN)
+            logger.warning("Message truncated: chat_id=%s", chat_id)
 
         if metadata.get("command") == "clear":
             await self.memory.clear(chat_id)
@@ -332,9 +289,9 @@ class Memoo:
                 pass
             await self.memory.add_message(chat_id, Message(role="assistant", content="(interrupted by new message)"))
 
+        history = await self.memory.get_history(chat_id)
         await self.memory.add_message(chat_id, Message(role="user", content=text, metadata=metadata))
 
-        history = await self.memory.get_history(chat_id)
         context = {
             "chat_id": chat_id,
             "sandbox_dir": "./sandbox",
@@ -357,35 +314,32 @@ class Memoo:
             Message(
                 role="assistant",
                 content=result.response,
-                metadata={"topic": result.current_topic, "topic_changed": result.topic_changed, "usage": result.usage},
+                metadata={"topic": result.current_topic, "memory_notes": result.memory_notes, "usage": result.usage},
             ),
         )
 
+        if result.memory_notes:
+            logger.info("Memory notes for chat_id=%s: %s", chat_id, result.memory_notes)
         if result.current_topic:
             self._current_topics[chat_id] = result.current_topic
         if result.should_compress:
-            logger.info("Agent requested compression: %s", result.compress_reason)
             await self._compact_memory(chat_id)
 
         return result.response
 
     @crash_boundary("Memoo._handle_scheduled")
     async def _handle_scheduled(self, chat_id: str, prompt: str, channel_name: str) -> str:
-        """Handle scheduled task — deliver result to target chat unless NO_OP."""
         response = await self.handle_message(chat_id, prompt, {"source": "scheduler"})
-
-        if not _is_noop(response):
+        if response.strip():
             ch = self._channel_map.get(channel_name)
             if ch:
                 await ch.send(chat_id, f"[Scheduled Task]\n{response}")
         return response
 
     async def _handle_heartbeat(self, prompt: str, context: dict[str, Any]) -> str:
-        """Handle heartbeat — forward actionable results unless NO_OP."""
         heartbeat_chat = f"__heartbeat__{context.get('task_name', 'default')}"
         response = await self.handle_message(heartbeat_chat, prompt, {"source": "heartbeat", **context})
-
-        if not _is_noop(response):
+        if response.strip():
             task_name = context.get("task_name", "heartbeat")
             notification = f"[Heartbeat: {task_name}]\n{response}"
             for ch in self.channels:
@@ -393,7 +347,6 @@ class Memoo:
                     await ch.send("__broadcast__", notification)
                 except Exception:
                     logger.debug("Failed to broadcast heartbeat to channel", exc_info=True)
-
         return response
 
     async def _compact_memory(self, chat_id: str) -> None:
@@ -461,13 +414,14 @@ class Memoo:
         await self.scheduler.stop()
         for ch in self.channels:
             await ch.stop()
+        await self.gateway.stop()
         await self.memory.close()
         logger.info("Memoo stopped.")
 
 
 async def main() -> None:
-    config = load_config()
-    app = Memoo(config)
+    cfg = AppConfig.load()
+    app = Memoo(cfg)
 
     loop = asyncio.get_running_loop()
     stop_event = asyncio.Event()
@@ -482,10 +436,9 @@ async def main() -> None:
     await stop_event.wait()
     await app.stop()
 
-    # Force exit — kill any lingering executor threads
-    import os
+    import os as _os
 
-    os._exit(0)
+    _os._exit(0)
 
 
 if __name__ == "__main__":

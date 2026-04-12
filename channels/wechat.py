@@ -165,7 +165,7 @@ class WeChatChannel:
         try:
             await self.send_typing(from_user)
             response = await self._handler(from_user, user_text, metadata)
-            if response.strip() != "NO_OP":
+            if response.strip():
                 await self.send(from_user, response, context_token=context_token)
         except Exception:
             logger.exception("Error handling WeChat message from %s", from_user)

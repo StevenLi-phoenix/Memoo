@@ -46,7 +46,8 @@ class OpenAIProvider:
         messages: list[Message],
         system: str | None = None,
         tools: list[dict[str, Any]] | None = None,
-        max_tokens: int = 4096,
+        max_tokens: int = 128000,
+        output_schema: dict[str, Any] | None = None,
     ) -> LLMResponse:
         api_messages = self._build_messages(messages, system)
         oai_tools = self._convert_tools(tools) if tools else None
@@ -59,6 +60,13 @@ class OpenAIProvider:
         }
         if oai_tools:
             kwargs["tools"] = oai_tools
+
+        # Structured JSON output
+        if output_schema:
+            kwargs["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {"name": "agent_response", "strict": True, "schema": output_schema},
+            }
 
         logger.debug("OpenAI stream: %d msgs, %d tools", len(api_messages), len(tools or []))
         return await self._stream_response(**kwargs)

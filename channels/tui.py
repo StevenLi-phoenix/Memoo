@@ -77,7 +77,7 @@ class TUIChannel:
                 try:
                     print("\033[90m(thinking...)\033[0m", end="\r")
                     response = await self._handler(self._chat_id, text, {"platform": "tui"})
-                    if response.strip() != "NO_OP":
+                    if response.strip():
                         await self.send(self._chat_id, response)
                 except Exception:
                     logger.exception("Error handling TUI message")

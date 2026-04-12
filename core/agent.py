@@ -2,6 +2,9 @@
 
 The agent is the application's central entry point.
 All messages flow through the agent, which orchestrates LLM, tools, memory, and hooks.
+
+Final output is a structured JSON response (enforced by LLM output_config),
+eliminating the need for extra compression-decision calls.
 """
 
 from __future__ import annotations
@@ -18,48 +21,72 @@ from models import LLMProvider, LLMResponse, Message
 
 logger = logging.getLogger(__name__)
 
-# Safety cap even when max_rounds=0 (unlimited), prevents API budget exhaustion
 HARD_MAX_ROUNDS = 200
+CONTEXT_WINDOW_TOKENS = 128_000  # hard cap — compress when exceeded
+CHARS_PER_TOKEN = 3
 
-# Agent replies with this to suppress forwarding to the user
-NO_OP = "NO_OP"
-
-COMPRESS_DECISION_PROMPT = """\
-Based on the conversation below, answer in JSON:
-{{"topic_changed": true/false, "current_topic": "brief topic",
-"should_compress": true/false, "reason": "brief reason"}}
-
-Rules:
-- topic_changed: true if the user shifted to a substantially different subject
-- current_topic: concise 3-10 word description of what the conversation is currently focused on
-- should_compress: true if older messages are no longer relevant to the current topic and can be summarized
-- Only compress when the conversation is long enough to benefit from it
-
-Conversation (last 3 turns):
-{recent_turns}
-
-Total messages in history: {total_messages}
-Estimated tokens: {estimated_tokens}"""
+# JSON schema for the agent's final structured response
+RESPONSE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "reply": {
+            "type": "string",
+            "description": "Reply to the user. Empty string if nothing to say (NO_OP).",
+        },
+        "memory_notes": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Facts, preferences, or decisions worth remembering for future conversations.",
+        },
+        "current_topic": {
+            "type": "string",
+            "description": "Concise 3-10 word description of the current conversation topic.",
+        },
+        "should_compress": {
+            "type": "boolean",
+            "description": "True if older messages are no longer relevant and should be summarized.",
+        },
+    },
+    "required": ["reply", "memory_notes", "current_topic", "should_compress"],
+    "additionalProperties": False,
+}
 
 
 @dataclass
 class TurnResult:
-    """Result of a single agent turn, including metadata decisions."""
+    """Structured result from a single agent turn."""
 
     response: str
-    topic_changed: bool = False
+    memory_notes: list[str] = field(default_factory=list)
     current_topic: str = ""
     should_compress: bool = False
-    compress_reason: str = ""
     usage: dict[str, int] = field(default_factory=dict)
+
+    @property
+    def is_noop(self) -> bool:
+        return not self.response.strip()
+
+    @classmethod
+    def from_json(cls, data: dict[str, Any], usage: dict[str, int]) -> TurnResult:
+        return cls(
+            response=data.get("reply", ""),
+            memory_notes=data.get("memory_notes", []),
+            current_topic=data.get("current_topic", ""),
+            should_compress=data.get("should_compress", False),
+            usage=usage,
+        )
+
+    @classmethod
+    def fallback(cls, text: str, usage: dict[str, int]) -> TurnResult:
+        """Create a TurnResult from plain text when JSON parsing fails."""
+        return cls(response=text, usage=usage)
 
 
 class Agent:
     """Agentic loop: the central entry point for all interactions.
 
-    Handles message -> LLM -> tool calls -> loop until done.
-    Supports: unlimited rounds, fallback LLMs, tool authorization hooks,
-    cancellation via new messages, and smart end-of-turn compression decisions.
+    The LLM's final text output is constrained to RESPONSE_SCHEMA via output_config.
+    Tool calls proceed normally as intermediate steps.
     """
 
     def __init__(
@@ -70,27 +97,30 @@ class Agent:
         max_rounds: int = 0,
         fallback_llms: list[LLMProvider] | None = None,
         hooks: HookRegistry | None = None,
+        compressor_llm: LLMProvider | None = None,
+        memory: Any = None,
     ) -> None:
         self._llm = llm
         self._tools = tools
         self._system_prompt = system_prompt
-        self._max_rounds = max_rounds  # 0 = unlimited
+        self._max_rounds = max_rounds
         self._fallback_llms = fallback_llms or []
         self._hooks = hooks or HookRegistry()
+        # Cheap/fast LLM for context compression (haiku/mini). Falls back to main LLM.
+        self._compressor = compressor_llm or (fallback_llms[-1] if fallback_llms else llm)
+        self._memory = memory  # Optional: for archive-based context compression
         self._cancel_events: dict[str, asyncio.Event] = {}
+        # Cumulative token tracking across all runs
+        self.total_tokens: dict[str, int] = {"input_tokens": 0, "output_tokens": 0, "total_runs": 0}
 
     def cancel(self, run_id: str | None = None) -> None:
-        """Cancel an agent run by *run_id* (e.g. chat_id).
-
-        If *run_id* is ``None``, cancel **all** active runs.
-        """
         if run_id is not None:
             ev = self._cancel_events.get(run_id)
             if ev:
                 ev.set()
                 logger.info("Agent run cancelled (run_id=%s)", run_id)
         else:
-            for rid, ev in self._cancel_events.items():
+            for ev in self._cancel_events.values():
                 ev.set()
             if self._cancel_events:
                 logger.info("All agent runs cancelled (%d)", len(self._cancel_events))
@@ -101,17 +131,18 @@ class Agent:
         history: list[Message] | None = None,
         context: dict[str, Any] | None = None,
     ) -> TurnResult:
-        """Run the agent loop for a user message.
-
-        Returns TurnResult with response text and compression decision.
-        """
         ctx = context or {}
         run_id = str(ctx.get("chat_id", id(asyncio.current_task())))
         cancel_event = asyncio.Event()
         self._cancel_events[run_id] = cancel_event
 
         try:
-            return await self._run_loop(user_message, ctx, cancel_event, history)
+            result = await self._run_loop(user_message, ctx, cancel_event, history)
+            # Accumulate token usage
+            for k, v in result.usage.items():
+                self.total_tokens[k] = self.total_tokens.get(k, 0) + v
+            self.total_tokens["total_runs"] = self.total_tokens.get("total_runs", 0) + 1
+            return result
         finally:
             self._cancel_events.pop(run_id, None)
 
@@ -122,10 +153,9 @@ class Agent:
         cancel_event: asyncio.Event,
         history: list[Message] | None,
     ) -> TurnResult:
-        """Inner agent loop, isolated with its own *cancel_event*."""
         messages = list(history) if history else []
 
-        # Inject source context so agent knows who's talking
+        # Inject source context
         source = ctx.get("source", "")
         if source:
             prefix = f"[System: this message is from {source}"
@@ -136,6 +166,9 @@ class Agent:
             messages.append(Message(role="user", content=prefix + user_message))
         else:
             messages.append(Message(role="user", content=user_message))
+
+        # Hard cap: compress if context exceeds token window
+        messages = await self._enforce_context_window(messages)
 
         tool_schemas = self._tools.get_schemas() or None
         total_usage: dict[str, int] = {"input_tokens": 0, "output_tokens": 0}
@@ -157,42 +190,29 @@ class Agent:
                 total_usage[k] = total_usage.get(k, 0) + v
 
             if not response.has_tool_calls:
-                # End of turn — decide on compression
-                response_text = response.text or ""
-                decision = await self._end_of_turn_decision(messages, total_usage)
+                result = self._parse_structured_response(response.text or "", total_usage)
                 logger.info(
-                    "Agent done in %d rounds. topic_changed=%s, compress=%s",
+                    "Agent done in %d rounds. topic=%s, compress=%s, noop=%s",
                     round_num,
-                    decision.get("topic_changed"),
-                    decision.get("should_compress"),
+                    result.current_topic,
+                    result.should_compress,
+                    result.is_noop,
                 )
-                return TurnResult(
-                    response=response_text,
-                    topic_changed=decision.get("topic_changed", False),
-                    current_topic=decision.get("current_topic", ""),
-                    should_compress=decision.get("should_compress", False),
-                    compress_reason=decision.get("reason", ""),
-                    usage=total_usage,
-                )
+                return result
 
             # Record assistant turn with tool calls
             messages.append(Message(role="assistant", content=response.text or "", tool_calls=response.tool_calls))
 
-            # Execute tool calls with authorization hooks
+            # Execute tool calls
             for tc in response.tool_calls:
                 if cancel_event.is_set():
                     return TurnResult(response="(cancelled during tool execution)", usage=total_usage)
 
-                # Authorization check
                 approved, reason = await self._hooks.authorize(tc.name, tc.arguments, ctx)
                 if not approved:
                     logger.warning("Tool %s denied: %s", tc.name, reason)
                     messages.append(
-                        Message(
-                            role="tool_result",
-                            content=f"Authorization denied: {reason}",
-                            tool_call_id=tc.id,
-                        )
+                        Message(role="tool_result", content=f"Authorization denied: {reason}", tool_call_id=tc.id)
                     )
                     continue
 
@@ -201,56 +221,123 @@ class Agent:
                 messages.append(Message(role="tool_result", content=result, tool_call_id=tc.id))
 
         # Max rounds exceeded
-        logger.warning("Max rounds (%d) exceeded, forcing final answer", self._max_rounds)
+        logger.warning("Max rounds (%d) exceeded, forcing final answer", effective_max)
         response = await self._chat_with_fallback(messages, tools=None)
-        return TurnResult(response=response.text or "(max rounds reached)", usage=total_usage)
+        return self._parse_structured_response(response.text or "(max rounds reached)", total_usage)
 
-    async def _end_of_turn_decision(self, messages: list[Message], usage: dict[str, int]) -> dict[str, Any]:
-        """Ask LLM whether to compress memory at end of turn.
+    async def _enforce_context_window(self, messages: list[Message]) -> list[Message]:
+        """Hard cap: if context exceeds CONTEXT_WINDOW_TOKENS, compress in two phases.
 
-        Uses a lightweight call to decide if the topic changed and if old context
-        should be compressed.
+        Phase 1: Replace old messages with archived memory summaries (if available).
+        Phase 2: If still over budget, strip middle and summarize with cheap LLM.
         """
-        # Only worth checking if there's enough history
-        total_messages = len(messages)
-        estimated_tokens = sum(len(m.content) // 3 for m in messages if m.content)
+        total_tokens = self._estimate_tokens(messages)
+        if total_tokens <= CONTEXT_WINDOW_TOKENS:
+            return messages
 
-        if total_messages < 10 or estimated_tokens < 5000:
-            return {"topic_changed": False, "should_compress": False, "reason": "too short"}
+        logger.warning("Context: %d tokens > %d limit", total_tokens, CONTEXT_WINDOW_TOKENS)
 
-        # Get last 3 turns for context
-        recent = messages[-6:] if len(messages) >= 6 else messages
-        recent_text = "\n".join(f"[{m.role}]: {m.content[:200]}" for m in recent if m.content)
+        # --- Phase 1: Replace old messages with archived memory summaries ---
+        if self._memory:
+            from core.tools import get_context
 
-        prompt = COMPRESS_DECISION_PROMPT.format(
-            recent_turns=recent_text,
-            total_messages=total_messages,
-            estimated_tokens=estimated_tokens,
-        )
+            chat_id = get_context().get("chat_id", "")
+            if chat_id:
+                messages = await self._replace_with_memory(messages, chat_id)
 
+        # --- Phase 2: Strip middle, compress with cheap LLM ---
+        total_tokens = self._estimate_tokens(messages)
+        if total_tokens <= CONTEXT_WINDOW_TOKENS:
+            return messages
+
+        keep_start = min(2, len(messages))
+        keep_end = min(10, len(messages) - keep_start)
+
+        if len(messages) <= keep_start + keep_end:
+            return messages
+
+        head = messages[:keep_start]
+        middle = messages[keep_start : len(messages) - keep_end]
+        tail = messages[len(messages) - keep_end :]
+
+        middle_text = "\n".join(f"[{m.role}]: {m.content[:500]}" for m in middle if m.content)
         try:
-            resp = await self._llm.chat(
-                messages=[Message(role="user", content=prompt)],
-                system="You are a conversation analyzer. Respond only with valid JSON.",
-                max_tokens=100,
+            summary_resp = await self._compressor.chat(
+                messages=[Message(role="user", content=f"Summarize this conversation concisely:\n\n{middle_text}")],
+                system="Output a concise summary preserving key facts, decisions, and context.",
+                max_tokens=1000,
             )
-            if resp.text:
-                # Parse JSON from response
-                text = resp.text.strip()
-                if text.startswith("```"):
-                    text = text.split("\n", 1)[-1].rsplit("```", 1)[0]
-                return json.loads(text)
+            summary = summary_resp.text or ""
         except Exception:
-            logger.debug("Compression decision call failed, skipping", exc_info=True)
+            logger.exception("Context compression failed, truncating")
+            summary = f"[{len(middle)} messages omitted]"
 
-        return {"topic_changed": False, "should_compress": False, "reason": "decision_error"}
+        logger.info("Phase 2: %d middle msgs -> %d char summary", len(middle), len(summary))
+        return head + [Message(role="system", content=f"[Compressed context]: {summary}")] + tail
+
+    @staticmethod
+    def _estimate_tokens(messages: list[Message]) -> int:
+        return sum(len(m.content) for m in messages if m.content) // CHARS_PER_TOKEN
+
+    async def _replace_with_memory(self, messages: list[Message], chat_id: str) -> list[Message]:
+        """Phase 1: Replace old verbose messages with archived memory summaries.
+
+        Scans messages from oldest to newest. If a chunk of old messages has
+        already been archived (we have a summary for that period), replace
+        those messages with the compact summary.
+        """
+        try:
+            archives = await self._memory.list_archive(chat_id=chat_id, limit=10)
+        except Exception:
+            return messages
+
+        if not archives:
+            return messages
+
+        # Build a single summary from all archived entries
+        summary_parts = [f"- [{a.get('date', '?')}] {a['topic']}: {a.get('summary', '')}" for a in archives]
+        memory_summary = "Archived conversation history:\n" + "\n".join(summary_parts)
+
+        # Keep only recent messages (last N that fit in budget), prepend memory summary
+        target_tokens = int(CONTEXT_WINDOW_TOKENS * 0.7)
+        kept: list[Message] = []
+        token_count = len(memory_summary) // CHARS_PER_TOKEN
+
+        # Walk from newest to oldest, keep messages until we hit budget
+        for msg in reversed(messages):
+            msg_tokens = len(msg.content) // CHARS_PER_TOKEN if msg.content else 0
+            if token_count + msg_tokens > target_tokens:
+                break
+            kept.insert(0, msg)
+            token_count += msg_tokens
+
+        result = [Message(role="system", content=f"[Memory]: {memory_summary}")] + kept
+        logger.info(
+            "Phase 1: replaced %d old msgs with %d archives, kept %d recent msgs",
+            len(messages) - len(kept),
+            len(archives),
+            len(kept),
+        )
+        return result
+
+    @staticmethod
+    def _parse_structured_response(text: str, usage: dict[str, int]) -> TurnResult:
+        """Parse the LLM's JSON-constrained text output into a TurnResult."""
+        if not text.strip():
+            return TurnResult.fallback("", usage)
+        try:
+            data = json.loads(text)
+            return TurnResult.from_json(data, usage)
+        except (json.JSONDecodeError, TypeError):
+            # Fallback: treat raw text as reply (e.g. from OpenAI fallback without schema)
+            logger.debug("Failed to parse structured response, using raw text")
+            return TurnResult.fallback(text, usage)
 
     async def _chat_with_fallback(
         self,
         messages: list[Message],
         tools: list[dict] | None,  # type: ignore[type-arg]
     ) -> LLMResponse:
-        """Try primary LLM, fall back on failure."""
         providers = [self._llm, *self._fallback_llms]
         last_error: Exception | None = None
 
@@ -260,6 +347,7 @@ class Agent:
                     messages=messages,
                     system=self._system_prompt,
                     tools=tools,
+                    output_schema=RESPONSE_SCHEMA,
                 )
             except Exception as e:
                 from core.crash import report_crash

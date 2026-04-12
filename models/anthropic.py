@@ -71,7 +71,8 @@ class AnthropicProvider:
         messages: list[Message],
         system: str | None = None,
         tools: list[dict[str, Any]] | None = None,
-        max_tokens: int = 4096,
+        max_tokens: int = 128000,
+        output_schema: dict[str, Any] | None = None,
     ) -> LLMResponse:
         api_messages = self._build_messages(messages)
 
@@ -83,6 +84,10 @@ class AnthropicProvider:
 
         if system:
             kwargs["system"] = [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]
+
+        # Structured JSON output
+        if output_schema:
+            kwargs["output_config"] = {"format": {"type": "json_schema", "schema": output_schema}}
 
         all_tools: list[dict[str, Any]] = []
         if tools:

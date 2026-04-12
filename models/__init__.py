@@ -69,7 +69,8 @@ class LLMProvider(Protocol):
         messages: list[Message],
         system: str | None = None,
         tools: list[dict[str, Any]] | None = None,
-        max_tokens: int = 4096,
+        max_tokens: int = 128000,
+        output_schema: dict[str, Any] | None = None,
     ) -> LLMResponse: ...
 
     @property
