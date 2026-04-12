@@ -18,7 +18,7 @@ import yaml
 from dotenv import load_dotenv
 
 from channels import create_channel
-from core.agent import Agent, TurnResult
+from core.agent import NO_OP, Agent, TurnResult
 from core.crash import crash_boundary
 from core.crash import init as init_crash_handler
 from core.heartbeat import Heartbeat
@@ -43,6 +43,10 @@ init_crash_handler(
     logs_dir=".logs",
     webhook_url=os.environ.get("MEMOO_CRASH_WEBHOOK", ""),
 )
+
+
+def _is_noop(response: str) -> bool:
+    return response.strip() == NO_OP
 
 
 def load_config(path: str = "config.yaml") -> dict[str, Any]:
@@ -367,27 +371,25 @@ class Memoo:
 
     @crash_boundary("Memoo._handle_scheduled")
     async def _handle_scheduled(self, chat_id: str, prompt: str, channel_name: str) -> str:
-        """Handle scheduled task — run agent and deliver result to the target chat."""
+        """Handle scheduled task — deliver result to target chat unless NO_OP."""
         response = await self.handle_message(chat_id, prompt, {"source": "scheduler"})
 
-        # Deliver to target channel
-        ch = self._channel_map.get(channel_name)
-        if ch:
-            await ch.send(chat_id, f"[Scheduled Task]\n{response}")
+        if not _is_noop(response):
+            ch = self._channel_map.get(channel_name)
+            if ch:
+                await ch.send(chat_id, f"[Scheduled Task]\n{response}")
         return response
 
     async def _handle_heartbeat(self, prompt: str, context: dict[str, Any]) -> str:
-        """Handle heartbeat — run in system chat, forward actionable results to all active channels."""
+        """Handle heartbeat — forward actionable results unless NO_OP."""
         heartbeat_chat = f"__heartbeat__{context.get('task_name', 'default')}"
         response = await self.handle_message(heartbeat_chat, prompt, {"source": "heartbeat", **context})
 
-        # Forward non-trivial results to all active channels
-        if response.strip().lower() != "all clear":
+        if not _is_noop(response):
             task_name = context.get("task_name", "heartbeat")
             notification = f"[Heartbeat: {task_name}]\n{response}"
             for ch in self.channels:
                 try:
-                    # Send to a default/broadcast chat — each channel picks its own
                     await ch.send("__broadcast__", notification)
                 except Exception:
                     logger.debug("Failed to broadcast heartbeat to channel", exc_info=True)

@@ -21,6 +21,9 @@ logger = logging.getLogger(__name__)
 # Safety cap even when max_rounds=0 (unlimited), prevents API budget exhaustion
 HARD_MAX_ROUNDS = 200
 
+# Agent replies with this to suppress forwarding to the user
+NO_OP = "NO_OP"
+
 COMPRESS_DECISION_PROMPT = """\
 Based on the conversation below, answer in JSON:
 {{"topic_changed": true/false, "current_topic": "brief topic",
