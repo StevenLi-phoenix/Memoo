@@ -91,7 +91,7 @@ class AnthropicProvider:
             all_tools.append({"type": "web_search_20250305", "name": "web_search", "max_uses": 5})
         # Advisor strategy: consult a more capable model for hard decisions
         if self._advisor_model:
-            all_tools.append({"type": "advisor_20260301", "model": self._advisor_model})
+            all_tools.append({"type": "advisor_20260301", "name": "advisor", "model": self._advisor_model})
             kwargs["extra_headers"] = {"anthropic-beta": "advisor-tool-2026-03-01"}
         if all_tools:
             # Cache control on last non-special tool

@@ -122,8 +122,15 @@ class Heartbeat:
     async def _run_loop(self, handler: HeartbeatHandler) -> None:
         from core.crash import report_crash
 
-        # Wait for app to fully initialize
-        await asyncio.sleep(10)
+        # Initialize last_run so first fire waits a full interval
+        now = time.time()
+        for task in self._tasks:
+            if task.last_run == 0.0:
+                task.last_run = now
+
+        # Sleep until first task is due
+        sleep_time = self._next_sleep(now)
+        await asyncio.sleep(sleep_time)
 
         while self._running:
             now = time.time()
