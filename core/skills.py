@@ -122,13 +122,14 @@ class SkillRegistry:
 
 
 def _parse_skill_meta(skill_md: Path) -> SkillMeta | None:
-    """Parse YAML frontmatter from SKILL.md into SkillMeta."""
+    """Parse YAML frontmatter from SKILL.md into SkillMeta. Fails open on any error."""
     try:
         content = skill_md.read_text(encoding="utf-8")
-    except OSError:
+        meta, _ = parse_frontmatter(content)
+    except Exception:
+        logger.warning("Failed to parse %s, skipping", skill_md, exc_info=True)
         return None
 
-    meta, _ = parse_frontmatter(content)
     if not meta:
         logger.warning("No frontmatter in %s, skipping", skill_md)
         return None

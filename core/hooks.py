@@ -76,22 +76,29 @@ class HookRegistry:
 _rate_limit_state: dict[str, list[float]] = {}
 
 
-async def rate_limit_hook(tool_name: str, arguments: dict[str, Any], context: dict[str, Any]) -> tuple[bool, str]:
-    """Simple rate limiting hook. Tracks calls per chat per minute."""
-    import time
+def make_rate_limit_hook(max_per_minute: int = 30, window_seconds: int = 60) -> AuthHook:
+    """Create a rate limiting hook with configurable limits."""
 
-    key = f"{context.get('chat_id', '')}:{tool_name}"
-    now = time.time()
+    async def rate_limit_hook(tool_name: str, arguments: dict[str, Any], context: dict[str, Any]) -> tuple[bool, str]:
+        import time
 
-    calls = _rate_limit_state.setdefault(key, [])
-    calls[:] = [t for t in calls if now - t < 60]
+        key = f"{context.get('chat_id', '')}:{tool_name}"
+        now = time.time()
 
-    max_per_minute = 30
-    if len(calls) >= max_per_minute:
-        return False, f"Rate limit exceeded: {tool_name} ({max_per_minute}/min)"
+        calls = _rate_limit_state.setdefault(key, [])
+        calls[:] = [t for t in calls if now - t < window_seconds]
 
-    calls.append(now)
-    return True, "allowed"
+        if len(calls) >= max_per_minute:
+            return False, f"Rate limit exceeded: {tool_name} ({max_per_minute}/{window_seconds}s)"
+
+        calls.append(now)
+        return True, "allowed"
+
+    return rate_limit_hook
+
+
+# Default instance for backward compatibility
+rate_limit_hook = make_rate_limit_hook()
 
 
 async def sandbox_path_hook(tool_name: str, arguments: dict[str, Any], context: dict[str, Any]) -> tuple[bool, str]:

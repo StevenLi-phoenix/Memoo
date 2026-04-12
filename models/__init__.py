@@ -13,7 +13,14 @@ from typing import Any, Protocol, runtime_checkable
 logger = logging.getLogger(__name__)
 
 CACHE_PATH = Path("./data/model_cache.json")
-CACHE_TTL = 86400  # 24 hours
+CACHE_TTL = 86400  # 24 hours — overridden by config.llm.model_cache_ttl at startup
+
+
+def configure_model_cache(ttl: int | None = None) -> None:
+    """Override module-level cache defaults from config. Call once at startup."""
+    global CACHE_TTL
+    if ttl is not None:
+        CACHE_TTL = ttl
 
 
 @dataclass(frozen=True)

@@ -131,12 +131,13 @@ def _truncate(text: str, max_output: int = _MAX_OUTPUT) -> str:
 
 def register(registry: ToolRegistry, **deps: Any) -> None:
     """Register built-in tools. Requires macOS sandbox-exec."""
-    global _MAX_OUTPUT
+    global _MAX_OUTPUT, DEFAULT_EXEC_TIMEOUT
     from core.tools import get_context
 
     cfg = deps.get("config")
     if cfg:
         _MAX_OUTPUT = cfg.sandbox.max_output
+        DEFAULT_EXEC_TIMEOUT = cfg.sandbox.timeout
 
     base_sandbox = os.path.realpath(deps.get("sandbox_dir", "./sandbox"))
     os.makedirs(base_sandbox, exist_ok=True)

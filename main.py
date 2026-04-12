@@ -23,11 +23,19 @@ from core.crash import crash_boundary
 from core.crash import init as init_crash_handler
 from core.gateway import Gateway
 from core.heartbeat import Heartbeat
-from core.hooks import HookRegistry, rate_limit_hook, sandbox_path_hook
+from core.hooks import HookRegistry, make_rate_limit_hook, sandbox_path_hook
 from core.memory import Memory
 from core.scheduler import Scheduler
 from core.tools import ToolRegistry
-from models import DiscoverableProvider, LLMProvider, Message, ModelCache, ModelInfo, create_provider
+from models import (
+    DiscoverableProvider,
+    LLMProvider,
+    Message,
+    ModelCache,
+    ModelInfo,
+    configure_model_cache,
+    create_provider,
+)
 from tools import auto_discover_tools
 
 load_dotenv()
@@ -119,6 +127,7 @@ async def build_llm_registry(
     cfg: AppConfig,
 ) -> tuple[LLMProvider, list[LLMProvider], dict[str, list[ModelInfo]], dict[str, LLMProvider]]:
     """Build LLM providers with model discovery from AppConfig."""
+    configure_model_cache(ttl=cfg.llm.model_cache_ttl)
     web_search = cfg.tools.web_search
     cache = ModelCache()
 
@@ -204,7 +213,7 @@ class Memoo:
         self.tools = ToolRegistry()
         self.hooks = HookRegistry()
         self.hooks.add_hook(sandbox_path_hook)
-        self.hooks.add_hook(rate_limit_hook)
+        self.hooks.add_hook(make_rate_limit_hook(cfg.hooks.rate_limit_per_minute, cfg.hooks.rate_limit_window))
         self.hooks.allow("current_time", "list_schedules", "list_memories", "get_config")
 
         self.agent: Agent | None = None

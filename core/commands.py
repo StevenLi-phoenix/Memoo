@@ -199,7 +199,8 @@ async def _cmd_memory(chat_id: str, deps: dict[str, Any]) -> str:
 async def _cmd_dream(deps: dict[str, Any]) -> str:
     memory = deps.get("memory")
     app = deps.get("app")
-    if not memory or not app:
+    config = deps.get("config")
+    if not memory or not app or not config:
         return "Dream not available — missing dependencies."
     llm = getattr(app, "llm", None)
     if not llm:
@@ -207,7 +208,7 @@ async def _cmd_dream(deps: dict[str, Any]) -> str:
 
     from core.dream import run_dream
 
-    return await run_dream(memory, llm)
+    return await run_dream(memory, llm, config)
 
 
 async def _cmd_schedule(deps: dict[str, Any]) -> str:
