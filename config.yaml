@@ -6,10 +6,11 @@ llm:
   providers:
     - name: anthropic
       provider: anthropic
-      # model: auto-discovered, or set preference e.g. "claude-sonnet"
+      # model: auto-discovered, or set preference substring e.g. "sonnet"
+      advisor: opus  # advisor strategy: pick best Opus model as advisor
     - name: openai
       provider: openai
-      # model: auto-discovered, or set preference e.g. "gpt-4o"
+      # model: auto-discovered
   fallback:
     - openai
 

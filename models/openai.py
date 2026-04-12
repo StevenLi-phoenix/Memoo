@@ -1,4 +1,4 @@
-"""OpenAI API provider with function calling and model discovery."""
+"""OpenAI API provider with streaming, function calling, and model discovery."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 
 class OpenAIProvider:
-    """OpenAI API provider."""
+    """OpenAI API provider with streaming support."""
 
     def __init__(self, api_key: str, model: str = "") -> None:
         self._client = openai.AsyncOpenAI(api_key=api_key)
@@ -31,19 +31,11 @@ class OpenAIProvider:
         self._model = value
 
     async def discover_models(self) -> list[ModelInfo]:
-        """List available models from OpenAI API."""
         models: list[ModelInfo] = []
         try:
             page = await self._client.models.list()
             for m in page.data:
-                models.append(
-                    ModelInfo(
-                        id=m.id,
-                        provider="openai",
-                        display_name=m.id,
-                        created=m.created,
-                    )
-                )
+                models.append(ModelInfo(id=m.id, provider="openai", display_name=m.id, created=m.created))
             logger.info("OpenAI: discovered %d models", len(models))
         except Exception:
             logger.exception("OpenAI model discovery failed")
@@ -59,12 +51,82 @@ class OpenAIProvider:
         api_messages = self._build_messages(messages, system)
         oai_tools = self._convert_tools(tools) if tools else None
 
-        kwargs: dict[str, Any] = {"model": self._model, "messages": api_messages, "max_tokens": max_tokens}
+        kwargs: dict[str, Any] = {
+            "model": self._model,
+            "messages": api_messages,
+            "max_tokens": max_tokens,
+            "stream": True,
+        }
         if oai_tools:
             kwargs["tools"] = oai_tools
 
-        response = await self._client.chat.completions.create(**kwargs)
-        return self._parse_response(response)
+        logger.debug("OpenAI stream: %d msgs, %d tools", len(api_messages), len(tools or []))
+        return await self._stream_response(**kwargs)
+
+    async def _stream_response(self, **kwargs: Any) -> LLMResponse:
+        """Streaming API call — accumulates deltas incrementally."""
+        text_parts: list[str] = []
+        stop_reason = "stop"
+        usage_dict: dict[str, int] = {}
+
+        # tool_calls are streamed as indexed deltas
+        tool_map: dict[int, dict[str, Any]] = {}  # index -> {id, name, arguments_json}
+
+        stream = await self._client.chat.completions.create(**kwargs)
+
+        async for chunk in stream:
+            if not chunk.choices:
+                # Usage-only chunk (stream_options)
+                if chunk.usage:
+                    usage_dict = {
+                        "input_tokens": chunk.usage.prompt_tokens,
+                        "output_tokens": chunk.usage.completion_tokens,
+                    }
+                continue
+
+            choice = chunk.choices[0]
+            delta = choice.delta
+
+            if choice.finish_reason:
+                stop_reason = choice.finish_reason
+
+            if delta.content:
+                text_parts.append(delta.content)
+
+            if delta.tool_calls:
+                for tc_delta in delta.tool_calls:
+                    idx = tc_delta.index
+                    if idx not in tool_map:
+                        tool_map[idx] = {
+                            "id": tc_delta.id or "",
+                            "name": "",
+                            "arguments_json": "",
+                        }
+                    entry = tool_map[idx]
+                    if tc_delta.id:
+                        entry["id"] = tc_delta.id
+                    if tc_delta.function:
+                        if tc_delta.function.name:
+                            entry["name"] = tc_delta.function.name
+                        if tc_delta.function.arguments:
+                            entry["arguments_json"] += tc_delta.function.arguments
+
+        # Build tool_calls from accumulated deltas
+        tool_calls: list[ToolCall] = []
+        for idx in sorted(tool_map):
+            entry = tool_map[idx]
+            try:
+                arguments = json.loads(entry["arguments_json"]) if entry["arguments_json"] else {}
+            except json.JSONDecodeError:
+                arguments = {}
+            tool_calls.append(ToolCall(id=entry["id"], name=entry["name"], arguments=arguments))
+
+        return LLMResponse(
+            text="".join(text_parts) if text_parts else None,
+            tool_calls=tool_calls,
+            stop_reason=stop_reason,
+            usage=usage_dict,
+        )
 
     def _build_messages(self, messages: list[Message], system: str | None) -> list[dict[str, Any]]:
         api_msgs: list[dict[str, Any]] = []
@@ -104,27 +166,3 @@ class OpenAIProvider:
             }
             for t in tools
         ]
-
-    def _parse_response(self, response: openai.types.chat.ChatCompletion) -> LLMResponse:
-        choice = response.choices[0]
-        msg = choice.message
-        tool_calls: list[ToolCall] = []
-        if msg.tool_calls:
-            for tc in msg.tool_calls:
-                tool_calls.append(
-                    ToolCall(id=tc.id, name=tc.function.name, arguments=json.loads(tc.function.arguments))
-                )
-
-        usage_dict: dict[str, int] = {}
-        if response.usage:
-            usage_dict = {
-                "input_tokens": response.usage.prompt_tokens,
-                "output_tokens": response.usage.completion_tokens,
-            }
-
-        return LLMResponse(
-            text=msg.content,
-            tool_calls=tool_calls,
-            stop_reason=choice.finish_reason or "stop",
-            usage=usage_dict,
-        )

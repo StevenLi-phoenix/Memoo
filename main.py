@@ -146,7 +146,7 @@ async def build_llm_registry(
         models = await _discover_and_cache(p_type, provider, cache)
         all_discovered[p_name] = models
 
-        # Pick model
+        # Pick executor model
         model_id = _pick_model(models, preference)
         if not model_id:
             logger.warning("No models available for %s, skipping", p_name)
@@ -154,6 +154,18 @@ async def build_llm_registry(
 
         # Set the chosen model
         provider.model_name = model_id  # type: ignore[union-attr]
+
+        # Resolve advisor model from discovered models (Anthropic only)
+        if p_type == "anthropic":
+            advisor_pref = p_conf.get("advisor", "") if isinstance(p_conf, dict) else ""
+            if advisor_pref:
+                advisor_id = _pick_model(models, advisor_pref)
+                if advisor_id and advisor_id != model_id:
+                    provider._advisor_model = advisor_id  # type: ignore[union-attr]
+                    logger.info("%s: advisor model %s", p_name, advisor_id)
+                else:
+                    logger.warning("%s: advisor model '%s' not found or same as executor", p_name, advisor_pref)
+
         built[p_name] = provider
         logger.info("%s: selected model %s (from %d available)", p_name, model_id, len(models))
 
@@ -345,15 +357,32 @@ class Memoo:
         return result.response
 
     async def _handle_scheduled(self, chat_id: str, prompt: str, channel_name: str) -> str:
+        """Handle scheduled task — run agent and deliver result to the target chat."""
         response = await self.handle_message(chat_id, prompt, {"source": "scheduler"})
+
+        # Deliver to target channel
         ch = self._channel_map.get(channel_name)
         if ch:
-            await ch.send(chat_id, response)
+            await ch.send(chat_id, f"[Scheduled Task]\n{response}")
         return response
 
     async def _handle_heartbeat(self, prompt: str, context: dict[str, Any]) -> str:
+        """Handle heartbeat — run in system chat, forward actionable results to all active channels."""
         heartbeat_chat = f"__heartbeat__{context.get('task_name', 'default')}"
-        return await self.handle_message(heartbeat_chat, prompt, {"source": "heartbeat", **context})
+        response = await self.handle_message(heartbeat_chat, prompt, {"source": "heartbeat", **context})
+
+        # Forward non-trivial results to all active channels
+        if response.strip().lower() != "all clear":
+            task_name = context.get("task_name", "heartbeat")
+            notification = f"[Heartbeat: {task_name}]\n{response}"
+            for ch in self.channels:
+                try:
+                    # Send to a default/broadcast chat — each channel picks its own
+                    await ch.send("__broadcast__", notification)
+                except Exception:
+                    logger.debug("Failed to broadcast heartbeat to channel", exc_info=True)
+
+        return response
 
     async def _compact_memory(self, chat_id: str) -> None:
         if self.llm is None:
@@ -440,6 +469,11 @@ async def main() -> None:
     await app.start()
     await stop_event.wait()
     await app.stop()
+
+    # Force exit — kill any lingering executor threads
+    import os
+
+    os._exit(0)
 
 
 if __name__ == "__main__":

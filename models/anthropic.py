@@ -1,7 +1,8 @@
-"""Anthropic Claude API provider with tool_use, prompt caching, native web search, and model discovery."""
+"""Anthropic Claude API provider with streaming, tool_use, prompt caching, web search, and model discovery."""
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any
 
@@ -13,19 +14,21 @@ logger = logging.getLogger(__name__)
 
 
 class AnthropicProvider:
-    """Claude API provider."""
+    """Claude API provider with streaming support."""
 
     def __init__(
         self,
         api_key: str,
         model: str = "",
         web_search: bool = True,
+        advisor_model: str = "",
     ) -> None:
         self._client = anthropic.AsyncAnthropic(api_key=api_key)
         self._model = model
         self._web_search = web_search
+        self._advisor_model = advisor_model
         if model:
-            logger.info("Anthropic provider: model=%s", model)
+            logger.info("Anthropic provider: model=%s, advisor=%s", model, advisor_model or "none")
 
     @property
     def model_name(self) -> str:
@@ -36,7 +39,6 @@ class AnthropicProvider:
         self._model = value
 
     async def discover_models(self) -> list[ModelInfo]:
-        """List available models from Anthropic API."""
         models: list[ModelInfo] = []
         try:
             page = await self._client.models.list(limit=100)
@@ -60,7 +62,6 @@ class AnthropicProvider:
             return 0
         if isinstance(val, (int, float)):
             return int(val)
-        # datetime object
         if hasattr(val, "timestamp"):
             return int(val.timestamp())
         return 0
@@ -88,14 +89,89 @@ class AnthropicProvider:
             all_tools.extend(tools)
         if self._web_search:
             all_tools.append({"type": "web_search_20250305", "name": "web_search", "max_uses": 5})
+        # Advisor strategy: consult a more capable model for hard decisions
+        if self._advisor_model:
+            all_tools.append({"type": "advisor_20260301", "model": self._advisor_model})
+            kwargs["betas"] = ["advisor-tool-2026-03-01"]
         if all_tools:
-            if all_tools[-1].get("type") != "web_search_20250305":
-                all_tools[-1] = {**all_tools[-1], "cache_control": {"type": "ephemeral"}}
+            # Cache control on last non-special tool
+            for i in range(len(all_tools) - 1, -1, -1):
+                t = all_tools[i]
+                if t.get("type") not in ("web_search_20250305", "advisor_20260301"):
+                    all_tools[i] = {**t, "cache_control": {"type": "ephemeral"}}
+                    break
             kwargs["tools"] = all_tools
 
-        logger.debug("Anthropic: %d msgs, %d tools", len(api_messages), len(all_tools))
-        response = await self._client.messages.create(**kwargs)
-        return self._parse_response(response)
+        logger.debug(
+            "Anthropic stream: %d msgs, %d tools, advisor=%s",
+            len(api_messages),
+            len(all_tools),
+            bool(self._advisor_model),
+        )
+        return await self._stream_response(**kwargs)
+
+    async def _stream_response(self, **kwargs: Any) -> LLMResponse:
+        """Streaming API call — accumulates content blocks incrementally."""
+        text_parts: list[str] = []
+        tool_calls: list[ToolCall] = []
+        usage_dict: dict[str, int] = {}
+        stop_reason = "end_turn"
+
+        # Track current tool_use block being streamed
+        current_tool: dict[str, Any] | None = None
+        current_tool_json = ""
+
+        async with self._client.messages.stream(**kwargs) as stream:
+            async for event in stream:
+                if event.type == "content_block_start":
+                    block = event.content_block
+                    if block.type == "tool_use":
+                        current_tool = {"id": block.id, "name": block.name}
+                        current_tool_json = ""
+
+                elif event.type == "content_block_delta":
+                    delta = event.delta
+                    if delta.type == "text_delta":
+                        text_parts.append(delta.text)
+                    elif delta.type == "input_json_delta":
+                        current_tool_json += delta.partial_json
+
+                elif event.type == "content_block_stop":
+                    if current_tool is not None:
+                        try:
+                            arguments = json.loads(current_tool_json) if current_tool_json else {}
+                        except json.JSONDecodeError:
+                            arguments = {}
+                        tool_calls.append(
+                            ToolCall(
+                                id=current_tool["id"],
+                                name=current_tool["name"],
+                                arguments=arguments,
+                            )
+                        )
+                        current_tool = None
+                        current_tool_json = ""
+
+                elif event.type == "message_delta":
+                    stop_reason = getattr(event.delta, "stop_reason", stop_reason) or stop_reason
+
+            # Get final message for usage
+            final = await stream.get_final_message()
+            usage_dict = {
+                "input_tokens": final.usage.input_tokens,
+                "output_tokens": final.usage.output_tokens,
+            }
+            if hasattr(final.usage, "cache_creation_input_tokens"):
+                usage_dict["cache_creation_tokens"] = final.usage.cache_creation_input_tokens or 0
+            if hasattr(final.usage, "cache_read_input_tokens"):
+                usage_dict["cache_read_tokens"] = final.usage.cache_read_input_tokens or 0
+
+        return LLMResponse(
+            text="".join(text_parts) if text_parts else None,
+            tool_calls=tool_calls,
+            stop_reason=stop_reason,
+            usage=usage_dict,
+        )
 
     def _build_messages(self, messages: list[Message]) -> list[dict[str, Any]]:
         api_msgs: list[dict[str, Any]] = []
@@ -119,28 +195,3 @@ class AnthropicProvider:
             else:
                 api_msgs.append({"role": msg.role, "content": msg.content})
         return api_msgs
-
-    def _parse_response(self, response: anthropic.types.Message) -> LLMResponse:
-        text_parts: list[str] = []
-        tool_calls: list[ToolCall] = []
-        for block in response.content:
-            if block.type == "text":
-                text_parts.append(block.text)
-            elif block.type == "tool_use":
-                tool_calls.append(ToolCall(id=block.id, name=block.name, arguments=block.input))
-
-        usage_dict: dict[str, int] = {
-            "input_tokens": response.usage.input_tokens,
-            "output_tokens": response.usage.output_tokens,
-        }
-        if hasattr(response.usage, "cache_creation_input_tokens"):
-            usage_dict["cache_creation_tokens"] = response.usage.cache_creation_input_tokens or 0
-        if hasattr(response.usage, "cache_read_input_tokens"):
-            usage_dict["cache_read_tokens"] = response.usage.cache_read_input_tokens or 0
-
-        return LLMResponse(
-            text="\n".join(text_parts) if text_parts else None,
-            tool_calls=tool_calls,
-            stop_reason=response.stop_reason or "end_turn",
-            usage=usage_dict,
-        )

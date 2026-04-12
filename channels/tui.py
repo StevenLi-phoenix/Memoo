@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import select
 import sys
 
 from channels import MessageHandler
@@ -14,7 +15,7 @@ DEFAULT_CHAT_ID = "tui"
 
 
 class TUIChannel:
-    """Interactive terminal channel. Used as fallback when no other channel is enabled."""
+    """Interactive terminal channel. Uses select() for non-blocking stdin reads."""
 
     def __init__(self, chat_id: str = DEFAULT_CHAT_ID) -> None:
         self._chat_id = chat_id
@@ -45,45 +46,60 @@ class TUIChannel:
 
     async def _input_loop(self) -> None:
         loop = asyncio.get_running_loop()
-
-        while self._running:
-            try:
-                line = await loop.run_in_executor(None, self._read_line)
-            except (EOFError, KeyboardInterrupt):
-                break
-
-            if line is None:
-                break
-
-            text = line.strip()
-            if not text:
-                continue
-
-            if text in ("/quit", "/exit"):
-                print("Bye!")
-                # Signal shutdown
-                loop.call_soon(lambda: sys.exit(0))
-                break
-
-            if text == "/clear":
-                if self._handler is None:
-                    return
-                await self._handler(self._chat_id, text, {"command": "clear"})
-                print("Memory cleared.")
-                continue
-
-            if self._handler is None:
-                return
-            try:
-                response = await self._handler(self._chat_id, text, {"platform": "tui"})
-                await self.send(self._chat_id, response)
-            except Exception:
-                logger.exception("Error handling TUI message")
-                print("\033[31mError processing message.\033[0m")
-
-    @staticmethod
-    def _read_line() -> str | None:
         try:
-            return input("\033[33mYou:\033[0m ")
-        except EOFError:
+            while self._running:
+                # Non-blocking stdin check via run_in_executor + select
+                line = await loop.run_in_executor(None, self._read_line_nonblocking)
+
+                if line is None:
+                    if not self._running:
+                        break
+                    await asyncio.sleep(0.1)
+                    continue
+
+                text = line.strip()
+                if not text:
+                    continue
+
+                if text in ("/quit", "/exit"):
+                    print("Bye!")
+                    break
+
+                if text == "/clear":
+                    if self._handler is not None:
+                        await self._handler(self._chat_id, text, {"command": "clear"})
+                        print("Memory cleared.")
+                    continue
+
+                if self._handler is None:
+                    continue
+
+                try:
+                    print("\033[90m(thinking...)\033[0m", end="\r")
+                    response = await self._handler(self._chat_id, text, {"platform": "tui"})
+                    await self.send(self._chat_id, response)
+                except Exception:
+                    logger.exception("Error handling TUI message")
+                    print("\033[31mError processing message.\033[0m")
+        except asyncio.CancelledError:
+            pass
+
+    def _read_line_nonblocking(self) -> str | None:
+        """Read a line from stdin with 0.5s timeout using select().
+
+        Returns None if no input available (allows cancellation check).
+        """
+        try:
+            sys.stdout.write("\033[33mYou:\033[0m ")
+            sys.stdout.flush()
+            # Wait up to 0.5s for stdin to become readable
+            while self._running:
+                ready, _, _ = select.select([sys.stdin], [], [], 0.5)
+                if ready:
+                    line = sys.stdin.readline()
+                    if not line:  # EOF
+                        return None
+                    return line
+            return None
+        except (EOFError, OSError):
             return None
