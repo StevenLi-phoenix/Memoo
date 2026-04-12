@@ -150,7 +150,7 @@ class ToolRegistry:
             return json.dumps({"error": error})
 
         func = self._tools[name]
-        logger.info("Executing tool: %s(%s)", name, arguments)
+        logger.info("Tool call: %s(%s)", name, _summarize_args(arguments))
 
         try:
             if inspect.iscoroutinefunction(func):
@@ -158,14 +158,25 @@ class ToolRegistry:
             else:
                 result = func(**arguments)
 
-            if isinstance(result, str):
-                return result
-            return json.dumps(result, ensure_ascii=False, default=str)
+            output = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False, default=str)
+            preview = output.replace("\n", " ")[:120]
+            logger.info("Tool OK: %s -> %s", name, preview)
+            return output
         except Exception as e:
             error = f"Tool {name} failed: {e}"
-            logger.exception(error)
+            logger.error("Tool FAIL: %s -> %s", name, e)
             return json.dumps({"error": error})
 
     @property
     def tool_names(self) -> list[str]:
         return list(self._tools.keys())
+
+
+def _summarize_args(args: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for k, v in args.items():
+        s = repr(v)
+        if len(s) > 50:
+            s = s[:47] + "..."
+        parts.append(f"{k}={s}")
+    return ", ".join(parts)

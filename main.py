@@ -207,6 +207,7 @@ class Memoo:
             fallback_llms=self.fallback_llms,
             hooks=self.hooks,
             memory=self.memory,
+            gateway=self.gateway,
         )
 
         auto_discover_tools(
@@ -317,6 +318,9 @@ class Memoo:
                 metadata={"topic": result.current_topic, "memory_notes": result.memory_notes, "usage": result.usage},
             ),
         )
+
+        if not result.did_success:
+            logger.warning("Agent reported failure for chat_id=%s: %s", chat_id, result.response[:200])
 
         if result.memory_notes:
             logger.info("Memory notes for chat_id=%s: %s", chat_id, result.memory_notes)

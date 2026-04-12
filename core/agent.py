@@ -46,8 +46,12 @@ RESPONSE_SCHEMA: dict[str, Any] = {
             "type": "boolean",
             "description": "True if older messages are no longer relevant and should be summarized.",
         },
+        "did_success": {
+            "type": "boolean",
+            "description": "True if task completed successfully. False if any error occurred.",
+        },
     },
-    "required": ["reply", "memory_notes", "current_topic", "should_compress"],
+    "required": ["reply", "memory_notes", "current_topic", "should_compress", "did_success"],
     "additionalProperties": False,
 }
 
@@ -60,6 +64,7 @@ class TurnResult:
     memory_notes: list[str] = field(default_factory=list)
     current_topic: str = ""
     should_compress: bool = False
+    did_success: bool = True
     usage: dict[str, int] = field(default_factory=dict)
 
     @property
@@ -73,6 +78,7 @@ class TurnResult:
             memory_notes=data.get("memory_notes", []),
             current_topic=data.get("current_topic", ""),
             should_compress=data.get("should_compress", False),
+            did_success=data.get("did_success", True),
             usage=usage,
         )
 
@@ -99,6 +105,7 @@ class Agent:
         hooks: HookRegistry | None = None,
         compressor_llm: LLMProvider | None = None,
         memory: Any = None,
+        gateway: Any = None,
     ) -> None:
         self._llm = llm
         self._tools = tools
@@ -108,7 +115,8 @@ class Agent:
         self._hooks = hooks or HookRegistry()
         # Cheap/fast LLM for context compression (haiku/mini). Falls back to main LLM.
         self._compressor = compressor_llm or (fallback_llms[-1] if fallback_llms else llm)
-        self._memory = memory  # Optional: for archive-based context compression
+        self._memory = memory
+        self._gateway = gateway  # For streaming tool events to clients
         self._cancel_events: dict[str, asyncio.Event] = {}
         # Cumulative token tracking across all runs
         self.total_tokens: dict[str, int] = {"input_tokens": 0, "output_tokens": 0, "total_runs": 0}
@@ -189,13 +197,19 @@ class Agent:
             for k, v in response.usage.items():
                 total_usage[k] = total_usage.get(k, 0) + v
 
+            # Log cache status per round
+            cache_read = response.usage.get("cache_read_tokens", 0)
+            cache_create = response.usage.get("cache_creation_tokens", 0)
+            if cache_read or cache_create:
+                logger.info("Cache: read=%d, created=%d", cache_read, cache_create)
+
             if not response.has_tool_calls:
                 result = self._parse_structured_response(response.text or "", total_usage)
                 logger.info(
-                    "Agent done in %d rounds. topic=%s, compress=%s, noop=%s",
+                    "Agent done in %d rounds. topic=%s, success=%s, noop=%s",
                     round_num,
                     result.current_topic,
-                    result.should_compress,
+                    result.did_success,
                     result.is_noop,
                 )
                 return result
@@ -217,8 +231,24 @@ class Agent:
                     continue
 
                 logger.info("Tool call: %s(id=%s)", tc.name, tc.id)
-                result = await self._tools.execute(tc.name, tc.arguments)
-                messages.append(Message(role="tool_result", content=result, tool_call_id=tc.id))
+
+                # Stream tool_start event to gateway clients
+                chat_id = ctx.get("chat_id", "")
+                if self._gateway and chat_id:
+                    args_preview = ", ".join(f"{k}={repr(v)[:50]}" for k, v in tc.arguments.items())
+                    self._gateway.send_event(chat_id, {"event": "tool_start", "name": tc.name, "args": args_preview})
+
+                tool_result = await self._tools.execute(tc.name, tc.arguments)
+
+                # Stream tool_done event
+                if self._gateway and chat_id:
+                    ok = "error" not in tool_result[:20].lower()
+                    preview = tool_result.replace("\n", " ")[:120]
+                    self._gateway.send_event(
+                        chat_id, {"event": "tool_done", "name": tc.name, "ok": ok, "result": preview}
+                    )
+
+                messages.append(Message(role="tool_result", content=tool_result, tool_call_id=tc.id))
 
         # Max rounds exceeded
         logger.warning("Max rounds (%d) exceeded, forcing final answer", effective_max)

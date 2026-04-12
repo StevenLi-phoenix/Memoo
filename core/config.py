@@ -190,13 +190,20 @@ class AppConfig:
         return {
             "host": self.host,
             "port": self.port,
-            "llm_default": self.llm.default,
-            "llm_providers": [p.name for p in self.llm.providers],
-            "llm_fallback": self.llm.fallback,
-            "agent_system_prompt": self.agent.system_prompt,
-            "agent_max_tool_rounds": self.agent.max_tool_rounds,
-            "memory_token_window": self.memory.token_window,
+            "llm": {
+                "default": self.llm.default,
+                "providers": [
+                    {"name": p.name, "provider": p.provider, "model": p.model, "advisor": p.advisor}
+                    for p in self.llm.providers
+                ],
+                "fallback": self.llm.fallback,
+            },
+            "agent": {
+                "system_prompt": self.agent.system_prompt,
+                "max_tool_rounds": self.agent.max_tool_rounds,
+            },
+            "memory": {"token_window": self.memory.token_window},
             "channels": {n: c.enabled for n, c in self.channels.items()},
             "tools": {"web_search": self.tools.web_search, "run_code": self.tools.run_code},
-            "sandbox_timeout": self.sandbox.timeout,
+            "sandbox": {"timeout": self.sandbox.timeout},
         }

@@ -27,8 +27,63 @@ def register(registry: ToolRegistry, **deps: Any) -> None:
 
     @registry.tool
     def get_config() -> str:
-        """Get the current runtime configuration."""
+        """Get the current runtime configuration, including LLM providers and their models."""
         return json.dumps(config.to_dict(), indent=2, ensure_ascii=False)
+
+    @registry.tool
+    def set_model(provider_name: str, model: str) -> str:
+        """Set the model preference for an LLM provider. Validates against discovered models.
+
+        Args:
+            provider_name: Provider name (e.g. 'anthropic', 'openai').
+            model: Model name or substring preference (e.g. 'haiku', 'gpt-4o', 'opus').
+        """
+        from models import ModelCache
+
+        for p in config.llm.providers:
+            if p.name == provider_name:
+                # Validate against discovered models
+                cache = ModelCache()
+                cached = cache.get(p.provider)
+                if cached:
+                    # Exact match
+                    exact = [m for m in cached if m.id == model]
+                    # Substring match
+                    matches = exact or [m for m in cached if model in m.id]
+                    if not matches:
+                        model_ids = [m.id for m in sorted(cached, key=lambda x: x.created, reverse=True)[:10]]
+                        return (
+                            f"Model '{model}' not found for {provider_name}. "
+                            f"Available (newest first): {', '.join(model_ids)}"
+                        )
+                    # Use the best match (exact > newest substring match)
+                    resolved = exact[0].id if exact else sorted(matches, key=lambda x: x.created, reverse=True)[0].id
+                else:
+                    resolved = model  # No cache — accept as preference
+
+                old = p.model
+                p.model = resolved
+                config.save()
+                logger.info("Model preference updated: %s: %s -> %s", provider_name, old, resolved)
+                return f"Model for '{provider_name}' set to '{resolved}'. Takes effect on next restart."
+
+        available = [p.name for p in config.llm.providers]
+        return f"Provider '{provider_name}' not found. Available: {', '.join(available)}"
+
+    @registry.tool
+    def set_default_provider(provider_name: str) -> str:
+        """Change the default LLM provider.
+
+        Args:
+            provider_name: Provider name to use as default (e.g. 'anthropic', 'openai').
+        """
+        available = [p.name for p in config.llm.providers]
+        if provider_name not in available:
+            return f"Provider '{provider_name}' not found. Available: {', '.join(available)}"
+        config.llm.default = provider_name
+        config.save()
+        logger.info("Default provider changed to: %s", provider_name)
+        return f"Default provider set to '{provider_name}'. Will take effect on next restart."
 
     @registry.tool
     async def update_config(key: str, value: str) -> str:
