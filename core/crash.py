@@ -72,6 +72,86 @@ def _global_excepthook(exc_type: type, exc_value: BaseException, exc_tb: Any) ->
     traceback.print_exception(exc_type, exc_value, exc_tb)
 
 
+def _collect_environment() -> dict[str, Any]:
+    """Collect runtime environment snapshot — only called on crash."""
+    import os
+    import platform
+    import resource
+
+    env: dict[str, Any] = {}
+
+    # System
+    env["platform"] = platform.platform()
+    env["python"] = sys.version
+    env["pid"] = os.getpid()
+    env["cwd"] = os.getcwd()
+
+    # Memory usage
+    try:
+        rusage = resource.getrusage(resource.RUSAGE_SELF)
+        env["memory_mb"] = round(rusage.ru_maxrss / (1024 * 1024), 1)  # macOS reports bytes
+        env["user_time_s"] = round(rusage.ru_utime, 2)
+        env["sys_time_s"] = round(rusage.ru_stime, 2)
+    except Exception:
+        pass
+
+    # Async tasks
+    try:
+        import asyncio
+
+        loop = asyncio.get_running_loop()
+        all_tasks = asyncio.all_tasks(loop)
+        env["async_tasks"] = len(all_tasks)
+        env["async_tasks_names"] = [t.get_name() for t in list(all_tasks)[:20]]
+    except Exception:
+        pass
+
+    # Threads
+    try:
+        import threading
+
+        env["threads"] = threading.active_count()
+        env["thread_names"] = [t.name for t in threading.enumerate()[:20]]
+    except Exception:
+        pass
+
+    # Open file descriptors
+    try:
+        fd_dir = f"/proc/{os.getpid()}/fd"
+        if os.path.isdir(fd_dir):
+            env["open_fds"] = len(os.listdir(fd_dir))
+        else:
+            # macOS fallback
+            import subprocess
+
+            result = subprocess.run(
+                ["lsof", "-p", str(os.getpid())],
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+            env["open_fds"] = result.stdout.count("\n") - 1 if result.returncode == 0 else -1
+    except Exception:
+        pass
+
+    # Key package versions
+    for pkg in ("anthropic", "openai", "httpx", "aiosqlite"):
+        try:
+            mod = __import__(pkg)
+            env[f"pkg_{pkg}"] = getattr(mod, "__version__", "?")
+        except ImportError:
+            pass
+
+    # Disk space on data dir
+    try:
+        stat = os.statvfs("./data")
+        env["disk_free_mb"] = round(stat.f_bavail * stat.f_frsize / (1024 * 1024), 0)
+    except Exception:
+        pass
+
+    return env
+
+
 def report_crash(
     error: BaseException,
     context: dict[str, Any] | None = None,
@@ -92,6 +172,7 @@ def report_crash(
         "traceback": traceback.format_exception(error),
         "component": component,
         "context": context or {},
+        "environment": _collect_environment(),
     }
 
     # Write crash report to file
