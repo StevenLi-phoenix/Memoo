@@ -258,6 +258,9 @@ class Memoo:
             system_prompt += "\n" + memory_context
             logger.info("Memory files injected into system prompt (%d chars)", len(memory_context))
 
+        # Resolve compressor LLM from config (dedicated instance to avoid sharing with fallback)
+        compressor_llm = self._resolve_compressor(self.cfg.llm.compressor) if self.cfg.llm.compressor else None
+
         self.agent = Agent(
             llm=self.llm,
             tools=self.tools,
@@ -265,6 +268,7 @@ class Memoo:
             max_rounds=self.cfg.agent.max_tool_rounds,
             fallback_llms=self.fallback_llms,
             hooks=self.hooks,
+            compressor_llm=compressor_llm,
             memory=self.memory,
             gateway=self.gateway,
             agent_config=self.cfg.agent,
@@ -309,6 +313,30 @@ class Memoo:
                     logger.info("Telegram bind code: %s  (send /bind %s to the bot)", ch.bind_code, ch.bind_code)
             except (ValueError, KeyError) as e:
                 logger.warning("Skipping channel %s: %s", channel_type, e)
+
+    def _resolve_compressor(self, preference: str) -> LLMProvider | None:
+        """Resolve a compressor model preference to a dedicated LLM provider instance."""
+        from models import ModelCache
+
+        cache = ModelCache()
+        for p_conf in self.cfg.llm.providers:
+            if p_conf.name not in self._providers:
+                continue
+            cached = cache.get(p_conf.provider)
+            if not cached:
+                continue
+            model_id = _pick_model(cached, preference)
+            if model_id:
+                try:
+                    api_key = _get_api_key(p_conf.provider)
+                except ValueError:
+                    continue
+                provider = create_provider(p_conf.provider, api_key=api_key)
+                provider.model_name = model_id  # type: ignore[union-attr]
+                logger.info("Compressor: %s (from %s)", model_id, p_conf.name)
+                return provider
+        logger.warning("Compressor preference '%s' not resolved, using fallback", preference)
+        return None
 
     def _resolve_channel_kwargs(self, channel_type: str, ch_config: Any) -> dict[str, Any]:
         env_prefix = channel_type.upper()

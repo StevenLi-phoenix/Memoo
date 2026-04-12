@@ -268,7 +268,9 @@ class ToolTracker:
         elapsed = time.monotonic() - self._active.pop(name, time.monotonic())
         status = f"{GREEN}✓{RESET}" if ok else f"{RED}✗{RESET}"
         elapsed_str = f" {DIM}({elapsed:.1f}s){RESET}" if elapsed >= 0.1 else ""
-        preview = result.replace("\n", " ")[:100]
+        # Use terminal width for preview length (leave room for prefix)
+        max_preview = max(_tw() - len(name) - 20, 40)
+        preview = result.replace("\n", " ")[:max_preview]
         result_str = f" {DIM}→ {preview}{RESET}" if preview else ""
         sys.stdout.write(f"{ERASE_LINE}\r  {status} {GREY}{name}{RESET}{elapsed_str}{result_str}\n")
         sys.stdout.flush()

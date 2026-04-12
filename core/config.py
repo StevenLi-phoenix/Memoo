@@ -29,6 +29,7 @@ class LLMConfig:
     default: str = "anthropic"
     providers: list[ProviderConfig] = field(default_factory=list)
     fallback: list[str] = field(default_factory=list)
+    compressor: str = ""  # model name/preference for context compression (e.g. "haiku", "gpt-5.4-mini")
     model_cache_ttl: int = 86400  # seconds (24h)
 
 
@@ -155,6 +156,7 @@ class AppConfig:
         llm_raw = raw.get("llm", {})
         cfg.llm.default = llm_raw.get("default", cfg.llm.default)
         cfg.llm.fallback = llm_raw.get("fallback", [])
+        cfg.llm.compressor = llm_raw.get("compressor", cfg.llm.compressor)
         cfg.llm.model_cache_ttl = llm_raw.get("model_cache_ttl", cfg.llm.model_cache_ttl)
         cfg.llm.providers = [
             ProviderConfig(
@@ -269,6 +271,7 @@ class AppConfig:
                     for p in self.llm.providers
                 ],
                 "fallback": self.llm.fallback,
+                "compressor": self.llm.compressor,
                 "model_cache_ttl": self.llm.model_cache_ttl,
             },
             "agent": {

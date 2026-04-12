@@ -234,16 +234,14 @@ class Gateway:
                 metadata = msg.get("metadata", {})
                 metadata["platform"] = "gateway"
 
-                # Bind first chat_id; reject mismatches
+                # Bind first chat_id; allow rebinding (e.g. TUI /new command)
                 if bound_chat_id is None:
                     bound_chat_id = chat_id
                     self._writer_chat_id[writer_id] = chat_id
                 elif chat_id != bound_chat_id:
-                    self._write(writer, {
-                        "event": "error",
-                        "error": f"chat_id mismatch: connection bound to '{bound_chat_id}'",
-                    })
-                    continue
+                    logger.info("Gateway: rebinding connection %s: %s -> %s", writer_id, bound_chat_id, chat_id)
+                    bound_chat_id = chat_id
+                    self._writer_chat_id[writer_id] = chat_id
 
                 if not text:
                     self._write(writer, {"event": "error", "error": "empty text"})

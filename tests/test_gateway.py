@@ -96,10 +96,13 @@ class TestGatewayMessaging:
             writer.close()
             await gw.stop()
 
-    async def test_chat_id_binding_rejects_mismatch(self, tmp_path) -> None:
+    async def test_chat_id_rebinding_allowed(self, tmp_path) -> None:
+        """Connections can rebind to a new chat_id (e.g. TUI /new command)."""
         gw = Gateway(host="127.0.0.1", port=0, token_file=tmp_path / ".token")
+        received_ids: list[str] = []
 
         async def handler(chat_id: str, text: str, metadata: dict) -> str:
+            received_ids.append(chat_id)
             return "ok"
 
         await gw.start(handler)
@@ -112,13 +115,14 @@ class TestGatewayMessaging:
 
             # First message binds chat_id
             await _write_json(writer, {"chat_id": "user1", "text": "hi"})
-            await _readline_json(reader)
+            resp1 = await _readline_json(reader)
+            assert resp1["event"] == "reply"
 
-            # Second with different chat_id should error
-            await _write_json(writer, {"chat_id": "user2", "text": "hi"})
-            resp = await _readline_json(reader)
-            assert resp["event"] == "error"
-            assert "mismatch" in resp["error"]
+            # Second with different chat_id should rebind and succeed
+            await _write_json(writer, {"chat_id": "user2", "text": "hello"})
+            resp2 = await _readline_json(reader)
+            assert resp2["event"] == "reply"
+            assert received_ids == ["user1", "user2"]
         finally:
             writer.close()
             await gw.stop()

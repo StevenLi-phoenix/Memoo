@@ -235,6 +235,12 @@ class Agent:
                 logger.info("Cache: read=%d, created=%d", cache_read, cache_create)
 
             if not response.has_tool_calls:
+                if response.stop_reason not in ("end_turn", "stop"):
+                    logger.warning(
+                        "Unexpected stop_reason=%s (out=%d tokens). Response may be truncated.",
+                        response.stop_reason,
+                        response.usage.get("output_tokens", 0),
+                    )
                 result = self._parse_structured_response(response.text or "", total_usage)
                 logger.info(
                     "Agent done in %d rounds. topic=%s, success=%s, noop=%s",
@@ -297,7 +303,7 @@ class Agent:
 
         if self._gateway and chat_id:
             ok = "error" not in result[:20].lower()
-            preview = result.replace("\n", " ")[:120]
+            preview = result.replace("\n", " ")[:500]
             event = {"event": "tool_done", "name": tc.name, "ok": ok, "result": preview}
             await self._gateway.send_event(chat_id, event)
 

@@ -1,20 +1,41 @@
 agent:
+  chars_per_token: 3
+  context_window_tokens: 128000
+  hard_max_rounds: 200
+  max_message_len: 50000
   max_tool_rounds: 0
   system_prompt: systemprompt/default.md
 channels:
   telegram:
+    allowed_users: []
     enabled: false
     mode: polling
   wechat:
+    allowed_users: []
     enabled: false
     mode: polling
+dream:
+  batch_size: 30
+embedding:
+  api_key: ''
+  base_url: http://localhost:1234/v1
+  model: text-embedding-nomic-embed-text-v1.5
+  provider: local
+heartbeat:
+  default_interval: 3600
+hooks:
+  rate_limit_per_minute: 30
+  rate_limit_window: 60
 host: localhost
 llm:
+  compressor: claude-haiku-4-5-20251001
   default: anthropic
   fallback:
   - openai
+  model_cache_ttl: 86400
   providers:
   - advisor: opus
+    model: claude-opus-4-6
     name: anthropic
     provider: anthropic
   - name: openai
@@ -23,23 +44,23 @@ memory:
   db_path: ./data/memory.db
   max_context_messages: 200
   token_window: 100000
+paths:
+  certs_dir: ./certs
+  heartbeat_dir: ./heartbeat
+  logs_dir: .logs
+  memory_dir: ./memory
+  sandbox_dir: ./sandbox
+  skills_dir: ./skills
 port: 8000
 sandbox:
   max_output: 10000
   timeout: 60
+scheduler:
+  default_channel: telegram
+subagent:
+  default_max_rounds: 10
+  max_depth: 3
 tools:
   read_file: true
   run_code: true
   web_search: true
-
-# Sub-agent spawning
-subagent:
-  max_depth: 3
-  default_max_rounds: 10
-
-# Embedding for semantic memory search
-# provider: local (lm-studio/llama.cpp/mlx/ollama) | openai | off
-embedding:
-  provider: local
-  base_url: http://localhost:1234/v1
-  model: text-embedding-nomic-embed-text-v1.5

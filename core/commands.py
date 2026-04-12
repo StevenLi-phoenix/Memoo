@@ -166,33 +166,12 @@ def _cmd_model(arg: str, deps: dict[str, Any]) -> str:
         lines.append("Switch: `/model <name>` (e.g. `/model haiku`)")
         return "\n".join(lines)
 
-    # Switch model
+    # Switch model — delegate to config_tools._update_model
+    from tools.config_tools import _update_model
 
-    # Use the config tool's set_model logic directly
-    from models import ModelCache
-
-    for p in config.llm.providers:
-        if p.name == config.llm.default:
-            cache = ModelCache()
-            cached = cache.get(p.provider)
-            if cached:
-                exact = [m for m in cached if m.id == arg]
-                matches = exact or [m for m in cached if arg in m.id]
-                if not matches:
-                    model_ids = [m.id for m in sorted(cached, key=lambda x: x.created, reverse=True)[:8]]
-                    return f"Model `{arg}` not found. Available:\n" + "\n".join(f"  `{m}`" for m in model_ids)
-                resolved = exact[0].id if exact else sorted(matches, key=lambda x: x.created, reverse=True)[0].id
-            else:
-                resolved = arg
-
-            old = getattr(app.llm, "model_name", "?")
-            app.llm.model_name = resolved  # type: ignore[union-attr]
-            p.model = resolved
-            config.save()
-            logger.info("Model switched via /model: %s -> %s", old, resolved)
-            return f"Model switched: `{old}` → `{resolved}`"
-
-    return "No default provider configured."
+    result = _update_model(arg, config, app)
+    logger.info("Model switched via /model: %s", result)
+    return result
 
 
 async def _cmd_compact(chat_id: str, deps: dict[str, Any]) -> str:
