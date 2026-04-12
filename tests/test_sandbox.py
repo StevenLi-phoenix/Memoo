@@ -1,11 +1,21 @@
-"""Tests for sandbox isolation — OS-level enforcement via sandbox-exec."""
+"""Tests for sandbox isolation — OS-level enforcement (macOS sandbox-exec / Linux bwrap)."""
 
 import os
+import platform
+import shutil
 
 import pytest
 
 from core.tools import ToolRegistry, set_context
 from tools.builtins import register
+
+_system = platform.system()
+_has_sandbox = (
+    (_system == "Darwin" and shutil.which("sandbox-exec") is not None)
+    or (_system == "Linux" and shutil.which("bwrap") is not None)
+)
+
+pytestmark = pytest.mark.skipif(not _has_sandbox, reason=f"No sandbox backend on {_system}")
 
 
 @pytest.fixture
@@ -14,9 +24,6 @@ def registry():
     register(r, sandbox_dir="./sandbox")
     set_context({"chat_id": "test-sandbox"})
     yield r
-    # Cleanup
-    import shutil
-
     shutil.rmtree("./sandbox/test-sandbox", ignore_errors=True)
 
 
@@ -35,7 +42,7 @@ class TestSandboxIsolation:
 
     async def test_write_outside_blocked(self, registry):
         r = await registry.execute("run_code", {"code": "echo pwned > /tmp/memoo-escape-test.txt", "language": "bash"})
-        assert "Operation not permitted" in r or "Permission denied" in r
+        assert "Operation not permitted" in r or "Permission denied" in r or "Read-only" in r
         assert not os.path.exists("/tmp/memoo-escape-test.txt")
 
     async def test_python_open_outside_blocked(self, registry):
@@ -50,17 +57,12 @@ class TestSandboxIsolation:
         assert "persist" in r
 
     async def test_session_isolation(self, registry):
-        # Write in session A
         set_context({"chat_id": "session-a"})
         await registry.execute("run_code", {"code": "echo secret > data.txt", "language": "bash"})
 
-        # Session B cannot see it
         set_context({"chat_id": "session-b"})
         r = await registry.execute("run_code", {"code": "cat data.txt 2>&1 || echo NOTFOUND", "language": "bash"})
         assert "NOTFOUND" in r or "No such file" in r
-
-        # Cleanup
-        import shutil
 
         shutil.rmtree("./sandbox/session-a", ignore_errors=True)
         shutil.rmtree("./sandbox/session-b", ignore_errors=True)

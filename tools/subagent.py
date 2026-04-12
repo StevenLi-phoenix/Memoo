@@ -277,7 +277,7 @@ def register(registry: ToolRegistry, **deps: Any) -> None:
             gateway=collector,
         )
 
-        # Sandbox restrictions via context flags (enforced by sandbox-exec SBPL profile)
+        # Sandbox restrictions via context flags (enforced by core.sandbox)
         sub_ctx: dict[str, Any] = {
             "chat_id": ctx.get("chat_id", ""),
             "sandbox_dir": ctx.get("sandbox_dir", "./sandbox"),
