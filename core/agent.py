@@ -121,7 +121,18 @@ class Agent:
     ) -> TurnResult:
         """Inner agent loop, isolated with its own *cancel_event*."""
         messages = list(history) if history else []
-        messages.append(Message(role="user", content=user_message))
+
+        # Inject source context so agent knows who's talking
+        source = ctx.get("source", "")
+        if source:
+            prefix = f"[System: this message is from {source}"
+            task_name = ctx.get("task_name", "")
+            if task_name:
+                prefix += f" ({task_name})"
+            prefix += ", not from the human user.]\n\n"
+            messages.append(Message(role="user", content=prefix + user_message))
+        else:
+            messages.append(Message(role="user", content=user_message))
 
         tool_schemas = self._tools.get_schemas() or None
         total_usage: dict[str, int] = {"input_tokens": 0, "output_tokens": 0}
