@@ -92,7 +92,7 @@ class AnthropicProvider:
         # Advisor strategy: consult a more capable model for hard decisions
         if self._advisor_model:
             all_tools.append({"type": "advisor_20260301", "model": self._advisor_model})
-            kwargs["betas"] = ["advisor-tool-2026-03-01"]
+            kwargs["extra_headers"] = {"anthropic-beta": "advisor-tool-2026-03-01"}
         if all_tools:
             # Cache control on last non-special tool
             for i in range(len(all_tools) - 1, -1, -1):

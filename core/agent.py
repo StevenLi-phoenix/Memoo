@@ -248,10 +248,12 @@ class Agent:
                     tools=tools,
                 )
             except Exception as e:
+                from core.crash import report_crash
+
                 last_error = e
                 if i < len(providers) - 1:
                     logger.warning("LLM %s failed (%s), trying fallback", llm.model_name, e)
                 else:
-                    logger.error("All LLM providers failed")
+                    report_crash(e, context={"providers_tried": len(providers)}, component="agent.llm")
 
         raise last_error or RuntimeError("No LLM providers available")

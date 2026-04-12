@@ -120,6 +120,8 @@ class Heartbeat:
         logger.info("Heartbeat stopped")
 
     async def _run_loop(self, handler: HeartbeatHandler) -> None:
+        from core.crash import report_crash
+
         # Wait for app to fully initialize
         await asyncio.sleep(10)
 
@@ -142,8 +144,8 @@ class Heartbeat:
                     response = await handler(task.prompt, context)
                     if response.strip().lower() != "all clear":
                         logger.info("Heartbeat %s: %s", task.name, response[:200])
-                except Exception:
-                    logger.exception("Heartbeat task %s failed", task.name)
+                except Exception as e:
+                    report_crash(e, context={"task": task.name}, component="heartbeat")
 
             # Sleep until the soonest next-due task
             sleep_time = self._next_sleep(now)

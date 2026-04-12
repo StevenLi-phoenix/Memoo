@@ -3,6 +3,7 @@ __pycache__/
 .venv/
 data/
 sandbox/
+.logs/
 .env
 *.egg-info/
 dist/

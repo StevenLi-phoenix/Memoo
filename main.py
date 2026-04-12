@@ -19,6 +19,8 @@ from dotenv import load_dotenv
 
 from channels import create_channel
 from core.agent import Agent, TurnResult
+from core.crash import crash_boundary
+from core.crash import init as init_crash_handler
 from core.heartbeat import Heartbeat
 from core.hooks import HookRegistry, rate_limit_hook, sandbox_path_hook
 from core.memory import Memory
@@ -35,6 +37,12 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("memoo")
+
+# Initialize crash handler — logs to .logs/, queues for auto-fix
+init_crash_handler(
+    logs_dir=".logs",
+    webhook_url=os.environ.get("MEMOO_CRASH_WEBHOOK", ""),
+)
 
 
 def load_config(path: str = "config.yaml") -> dict[str, Any]:
@@ -294,6 +302,7 @@ class Memoo:
             kwargs.update({k: v for k, v in ch_config.items() if k != "enabled"})
             return kwargs
 
+    @crash_boundary("Memoo.handle_message")
     async def handle_message(self, chat_id: str, text: str, metadata: dict[str, Any]) -> str:
         if self.agent is None or self.llm is None:
             return "Error: Memoo not initialized"
@@ -356,6 +365,7 @@ class Memoo:
 
         return result.response
 
+    @crash_boundary("Memoo._handle_scheduled")
     async def _handle_scheduled(self, chat_id: str, prompt: str, channel_name: str) -> str:
         """Handle scheduled task — run agent and deliver result to the target chat."""
         response = await self.handle_message(chat_id, prompt, {"source": "scheduler"})

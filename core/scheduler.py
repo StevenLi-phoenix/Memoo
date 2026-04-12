@@ -213,6 +213,8 @@ class Scheduler:
         return delay, earliest_tasks
 
     async def _run_loop(self, handler: ScheduleHandler) -> None:
+        from core.crash import report_crash
+
         while self._running:
             delay, tasks = await self._get_next_fire()
 
@@ -232,8 +234,8 @@ class Scheduler:
                 try:
                     response = await handler(task["chat_id"], task["prompt"], task["channel"])
                     logger.info("Scheduled task %s done: %s", task["name"], response[:100])
-                except Exception:
-                    logger.exception("Scheduled task %s failed", task["name"])
+                except Exception as e:
+                    report_crash(e, context={"task": task["name"]}, component="scheduler")
 
             # Brief sleep to avoid re-firing the same minute
             await asyncio.sleep(60)
