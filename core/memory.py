@@ -96,6 +96,16 @@ class Memory:
         Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
         self._db = await aiosqlite.connect(self._db_path)
         await self._db.executescript(_INIT_SQL)
+        # Migrate: add columns that may be missing in older databases
+        for col, defn in (
+            ("importance", "REAL NOT NULL DEFAULT 0.5"),
+            ("embedding", "TEXT"),
+        ):
+            try:
+                await self._db.execute(f"ALTER TABLE archive ADD COLUMN {col} {defn}")
+                logger.info("Migration: added archive.%s", col)
+            except Exception:
+                pass  # column already exists
         # FTS5 setup (may fail if already exists with different config, that's OK)
         try:
             await self._db.executescript(_FTS_SQL)

@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import re
 import shutil
 import signal
@@ -25,6 +26,8 @@ from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.styles import Style
+
+logger = logging.getLogger(__name__)
 
 # ─── ANSI helpers ───────────────────────────────────────────────────
 
@@ -294,6 +297,16 @@ class ToolTracker:
 _running = True
 
 
+def _read_gateway_token(token_arg: str | None) -> str:
+    """Read gateway token from CLI arg or .gateway-token file."""
+    if token_arg:
+        return token_arg
+    token_file = Path(".gateway-token")
+    if token_file.exists():
+        return token_file.read_text(encoding="utf-8").strip()
+    return ""
+
+
 async def main() -> None:
     global _running
 
@@ -304,6 +317,7 @@ async def main() -> None:
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--chat-id", default="tui")
     parser.add_argument("--timeout", type=int, default=600, help="Response timeout in seconds")
+    parser.add_argument("--token", default=None, help="Gateway auth token (auto-read from .gateway-token)")
     args = parser.parse_args()
 
     # mTLS if certs exist
@@ -326,14 +340,69 @@ async def main() -> None:
         print(f"Generate certs: {BOLD}python -m core.gateway --generate-certs{RESET}")
         return
 
+    # ── Auth handshake ──
+    token = _read_gateway_token(args.token)
+    if not token:
+        print(f"\n{RED}No gateway token found.{RESET}")
+        print("Pass --token or ensure .gateway-token exists (created by main.py).")
+        writer.close()
+        return
+
+    auth_msg = json.dumps({"auth": token})
+    writer.write(auth_msg.encode() + b"\n")
+    await writer.drain()
+
+    try:
+        auth_line = await asyncio.wait_for(reader.readline(), timeout=5)
+        auth_resp = json.loads(auth_line.decode())
+    except (asyncio.TimeoutError, json.JSONDecodeError, ConnectionResetError):
+        print(f"\n{RED}Auth handshake failed (timeout or bad response).{RESET}")
+        writer.close()
+        return
+
+    if auth_resp.get("event") != "auth_ok":
+        print(f"\n{RED}Auth failed: {auth_resp.get('error', 'unknown')}{RESET}")
+        writer.close()
+        return
+
     proto = "mTLS" if ssl_ctx else "TCP"
     _print_banner(args.host, args.port, proto, args.chat_id)
 
     loop = asyncio.get_running_loop()
 
+    # Background reader: feeds events into a queue, signals shutdown on disconnect
+    event_queue: asyncio.Queue[dict | None] = asyncio.Queue()
+    shutdown_event = asyncio.Event()
+
+    async def _bg_reader() -> None:
+        """Read gateway events in background, dispatch to queue."""
+        global _running
+        try:
+            while _running:
+                line = await reader.readline()
+                if not line:
+                    break
+                try:
+                    ev = json.loads(line.decode())
+                except json.JSONDecodeError:
+                    continue
+                if ev.get("event") == "shutdown":
+                    logger.info("Received shutdown from server")
+                    break
+                await event_queue.put(ev)
+        except (ConnectionResetError, asyncio.IncompleteReadError, OSError):
+            pass
+        finally:
+            _running = False
+            shutdown_event.set()
+            await event_queue.put(None)  # sentinel for _read_events
+
+    reader_task = asyncio.create_task(_bg_reader())
+
     def _stop() -> None:
         global _running
         _running = False
+        shutdown_event.set()
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, _stop)
@@ -345,13 +414,37 @@ async def main() -> None:
         complete_while_typing=True,
     )
 
+    server_shutdown = False
     while _running:
         try:
             with patch_stdout():
-                text = await session.prompt_async(
-                    [("class:prompt", "You: ")],
+                prompt_task = asyncio.ensure_future(
+                    session.prompt_async([("class:prompt", "You: ")])
                 )
+                shutdown_wait = asyncio.ensure_future(shutdown_event.wait())
+
+                done, pending = await asyncio.wait(
+                    {prompt_task, shutdown_wait},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+
+                for t in pending:
+                    t.cancel()
+                    try:
+                        await t
+                    except (asyncio.CancelledError, EOFError, KeyboardInterrupt):
+                        pass
+
+                if shutdown_wait in done:
+                    sys.stdout.write(f"{ERASE_LINE}\r")
+                    print(f"\n{YELLOW}Server is shutting down. Bye!{RESET}")
+                    server_shutdown = True
+                    break
+
+                text = prompt_task.result()
         except (EOFError, KeyboardInterrupt):
+            break
+        except asyncio.CancelledError:
             break
 
         text = text.strip()
@@ -360,16 +453,32 @@ async def main() -> None:
         if text in ("/quit", "/exit"):
             break
 
+        if text == "/new":
+            args.chat_id = f"tui_{int(time.time()) % 100000}"
+            print(f"\n{GREEN}New conversation started.{RESET} {DIM}(chat: {args.chat_id}){RESET}\n")
+            continue
+
         # All /commands go to server (which handles them without LLM)
         msg = json.dumps({"chat_id": args.chat_id, "text": text})
-        writer.write(msg.encode() + b"\n")
-        await writer.drain()
+        try:
+            writer.write(msg.encode() + b"\n")
+            await writer.drain()
+        except (ConnectionResetError, BrokenPipeError, OSError):
+            print(f"{RED}Connection lost.{RESET}")
+            break
 
-        await _read_events(reader, args.timeout)
-        # visual separator between exchanges
-        print(f"  {DIM}{'·' * min(40, _tw() - 4)}{RESET}\n")
+        await _read_events(event_queue, args.timeout)
+        if _running:
+            print(f"  {DIM}{'·' * min(40, _tw() - 4)}{RESET}\n")
 
-    print(f"\n{DIM}Bye!{RESET}")
+    reader_task.cancel()
+    try:
+        await reader_task
+    except asyncio.CancelledError:
+        pass
+
+    if not server_shutdown:
+        print(f"\n{DIM}Bye!{RESET}")
     writer.close()
     try:
         await writer.wait_closed()
@@ -377,8 +486,8 @@ async def main() -> None:
         pass
 
 
-async def _read_events(reader: asyncio.StreamReader, timeout: int = 600) -> None:
-    """Read streaming events from gateway with spinner animation."""
+async def _read_events(event_queue: asyncio.Queue[dict | None], timeout: int = 600) -> None:
+    """Read streaming events from queue with spinner animation."""
     tracker = ToolTracker()
 
     async def _spin() -> None:
@@ -394,20 +503,16 @@ async def _read_events(reader: asyncio.StreamReader, timeout: int = 600) -> None
     try:
         while True:
             try:
-                resp_line = await asyncio.wait_for(reader.readline(), timeout=timeout)
+                event = await asyncio.wait_for(event_queue.get(), timeout=timeout)
             except asyncio.TimeoutError:
                 sys.stdout.write(f"{ERASE_LINE}\r")
                 print(f"{RED}Timeout ({timeout}s) waiting for response.{RESET}")
                 break
 
-            if not resp_line:
-                print(f"\n{RED}Connection closed by server.{RESET}")
+            if event is None:
+                sys.stdout.write(f"{ERASE_LINE}\r")
+                print(f"\n{YELLOW}Server connection lost.{RESET}")
                 break
-
-            try:
-                event = json.loads(resp_line.decode())
-            except json.JSONDecodeError:
-                continue
 
             ev_type = event.get("event", "")
 

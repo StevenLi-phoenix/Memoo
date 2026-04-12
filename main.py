@@ -298,17 +298,34 @@ class Memoo:
                 self.channels.append(ch)
                 self._channel_map[channel_type] = ch
                 logger.info("Channel started: %s", channel_type)
+
+                # Log bind code for Telegram if no users bound yet
+                if channel_type == "telegram" and hasattr(ch, "bind_code") and not ch_config.allowed_users:
+                    logger.info("Telegram bind code: %s  (send /bind %s to the bot)", ch.bind_code, ch.bind_code)
             except (ValueError, KeyError) as e:
                 logger.warning("Skipping channel %s: %s", channel_type, e)
 
-    @staticmethod
-    def _resolve_channel_kwargs(channel_type: str, ch_config: Any) -> dict[str, Any]:
+    def _resolve_channel_kwargs(self, channel_type: str, ch_config: Any) -> dict[str, Any]:
         env_prefix = channel_type.upper()
         if channel_type == "telegram":
             token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
             if not token:
                 raise ValueError("TELEGRAM_BOT_TOKEN not set")
-            return {"token": token, "mode": ch_config.mode}
+
+            def _on_bind(user_id: str) -> None:
+                """Persist newly bound Telegram user to config.yaml."""
+                tg_cfg = self.cfg.channels.get("telegram")
+                if tg_cfg and user_id not in tg_cfg.allowed_users:
+                    tg_cfg.allowed_users.append(user_id)
+                    self.cfg.save()
+                    logger.info("Telegram user %s persisted to config.yaml", user_id)
+
+            return {
+                "token": token,
+                "mode": ch_config.mode,
+                "allowed_users": ch_config.allowed_users,
+                "on_bind": _on_bind,
+            }
         elif channel_type == "wechat":
             token = os.environ.get("WECHAT_ILINK_TOKEN", "")
             if not token:

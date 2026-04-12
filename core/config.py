@@ -53,6 +53,7 @@ class MemoryConfig:
 class ChannelConfig:
     enabled: bool = False
     mode: str = "polling"
+    allowed_users: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -186,6 +187,7 @@ class AppConfig:
                 cfg.channels[ch_name] = ChannelConfig(
                     enabled=ch_raw.get("enabled", False),
                     mode=ch_raw.get("mode", "polling"),
+                    allowed_users=ch_raw.get("allowed_users", []),
                 )
 
         # Tools
@@ -274,7 +276,10 @@ class AppConfig:
                 "max_context_messages": self.memory.max_context_messages,
                 "token_window": self.memory.token_window,
             },
-            "channels": {n: {"enabled": c.enabled, "mode": c.mode} for n, c in self.channels.items()},
+            "channels": {
+                n: {"enabled": c.enabled, "mode": c.mode, "allowed_users": c.allowed_users}
+                for n, c in self.channels.items()
+            },
             "tools": {
                 "web_search": self.tools.web_search,
                 "run_code": self.tools.run_code,

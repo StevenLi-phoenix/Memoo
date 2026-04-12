@@ -1,10 +1,17 @@
-"""JSON-over-TCP gateway with optional mTLS and streaming events.
+"""JSON-over-TCP gateway with optional mTLS, token auth, and streaming events.
 
 Protocol: line-delimited JSON over TCP (optionally TLS).
-  Client -> {"chat_id": "tui", "text": "hello"}
-  Server -> {"event": "tool_start", "name": "run_code", "args": "..."}
-  Server -> {"event": "tool_done", "name": "run_code", "ok": true, "result": "..."}
-  Server -> {"event": "reply", "reply": "...", "chat_id": "tui"}
+  1. Auth handshake (required):
+     Client -> {"auth": "<token>"}
+     Server -> {"event": "auth_ok"} or {"event": "auth_fail", "error": "..."}
+  2. Messages (after auth):
+     Client -> {"chat_id": "tui", "text": "hello"}
+     Server -> {"event": "tool_start", "name": "run_code", "args": "..."}
+     Server -> {"event": "tool_done", "name": "run_code", "ok": true, "result": "..."}
+     Server -> {"event": "reply", "reply": "...", "chat_id": "tui"}
+
+  The first chat_id used after auth is bound to the connection.
+  Subsequent messages must use the same chat_id.
 
 mTLS: Both server and client present certificates signed by the same CA.
   Generate certs: python -m core.gateway --generate-certs
@@ -15,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import secrets
 import ssl
 from pathlib import Path
 from typing import Any
@@ -78,16 +86,30 @@ def create_client_ssl(certs_dir: Path = CERTS_DIR) -> ssl.SSLContext | None:
 
 
 class Gateway:
-    """TCP/TLS server with streaming tool events."""
+    """TCP/TLS server with token auth, chat_id binding, and streaming tool events."""
 
-    def __init__(self, host: str = "localhost", port: int = 8000, ssl_ctx: ssl.SSLContext | None = None) -> None:
+    def __init__(
+        self,
+        host: str = "localhost",
+        port: int = 8000,
+        ssl_ctx: ssl.SSLContext | None = None,
+        token_file: Path | None = None,
+    ) -> None:
         self._host = host
         self._port = port
         self._ssl = ssl_ctx
+        self._token = secrets.token_urlsafe(32)
+        self._token_file = token_file or Path(".gateway-token")
         self._handler: MessageHandler | None = None
         self._server: asyncio.Server | None = None
         self._clients: dict[str, list[asyncio.StreamWriter]] = {}
+        self._all_writers: set[asyncio.StreamWriter] = set()
+        self._writer_chat_id: dict[int, str] = {}  # id(writer) -> bound chat_id
         self._reply_extra: dict[str, dict[str, Any]] = {}
+
+    @property
+    def token(self) -> str:
+        return self._token
 
     def set_reply_extra(self, chat_id: str, extra: dict[str, Any]) -> None:
         """Attach extra fields to the next reply event for this chat_id."""
@@ -96,13 +118,39 @@ class Gateway:
     async def start(self, handler: MessageHandler) -> None:
         self._handler = handler
         self._server = await asyncio.start_server(self._on_connect, self._host, self._port, ssl=self._ssl)
-        proto = "mTLS" if self._ssl else "TCP (no auth)"
+
+        # Write token to file (mode 0o600) for TUI auto-discovery
+        self._token_file.write_text(self._token, encoding="utf-8")
+        self._token_file.chmod(0o600)
+
+        proto = "mTLS + token" if self._ssl else "token auth"
         logger.info("Gateway listening on %s:%d (%s)", self._host, self._port, proto)
+        logger.info("Gateway token written to %s", self._token_file)
 
     async def stop(self) -> None:
+        # Broadcast shutdown to all connected clients
+        shutdown_line = json.dumps({"event": "shutdown"}).encode() + b"\n"
+        for w in list(self._all_writers):
+            try:
+                w.write(shutdown_line)
+                await w.drain()
+            except Exception:
+                pass
+            try:
+                w.close()
+            except Exception:
+                pass
+        self._all_writers.clear()
+        self._clients.clear()
+
         if self._server:
             self._server.close()
             await self._server.wait_closed()
+
+        # Remove token file on shutdown
+        if self._token_file.exists():
+            self._token_file.unlink()
+
         logger.info("Gateway stopped")
 
     def send_event(self, chat_id: str, event: dict[str, Any]) -> None:
@@ -122,13 +170,49 @@ class Gateway:
             try:
                 cert = ssl_obj.getpeercert()
                 cn = dict(x[0] for x in cert.get("subject", ())).get("commonName", "?")
-                logger.info("Gateway mTLS client: %s (CN=%s)", addr, cn)
+                logger.info("Gateway client connected: %s (mTLS CN=%s)", addr, cn)
             except Exception:
                 logger.info("Gateway client connected: %s (mTLS)", addr)
         else:
             logger.info("Gateway client connected: %s", addr)
 
-        current_chat_id: str | None = None
+        # ── Auth handshake: first message must be {"auth": "<token>"} ──
+        try:
+            auth_line = await asyncio.wait_for(reader.readline(), timeout=10)
+        except (asyncio.TimeoutError, ConnectionResetError, asyncio.IncompleteReadError):
+            logger.warning("Gateway auth timeout/disconnect from %s", addr)
+            writer.close()
+            return
+
+        if not auth_line:
+            writer.close()
+            return
+
+        try:
+            auth_msg = json.loads(auth_line.decode())
+        except json.JSONDecodeError:
+            self._write(writer, {"event": "auth_fail", "error": "invalid JSON"})
+            await self._drain_and_close(writer)
+            return
+
+        if not secrets.compare_digest(str(auth_msg.get("auth", "")), self._token):
+            self._write(writer, {"event": "auth_fail", "error": "invalid token"})
+            await self._drain_and_close(writer)
+            logger.warning("Gateway auth failed from %s", addr)
+            return
+
+        self._write(writer, {"event": "auth_ok"})
+        try:
+            await writer.drain()
+        except (ConnectionResetError, BrokenPipeError, OSError):
+            writer.close()
+            return
+        logger.info("Gateway client authenticated: %s", addr)
+
+        # ── Message loop (authenticated) ──
+        self._all_writers.add(writer)
+        writer_id = id(writer)
+        bound_chat_id: str | None = None
 
         try:
             while True:
@@ -147,6 +231,17 @@ class Gateway:
                 metadata = msg.get("metadata", {})
                 metadata["platform"] = "gateway"
 
+                # Bind first chat_id; reject mismatches
+                if bound_chat_id is None:
+                    bound_chat_id = chat_id
+                    self._writer_chat_id[writer_id] = chat_id
+                elif chat_id != bound_chat_id:
+                    self._write(writer, {
+                        "event": "error",
+                        "error": f"chat_id mismatch: connection bound to '{bound_chat_id}'",
+                    })
+                    continue
+
                 if not text:
                     self._write(writer, {"event": "error", "error": "empty text"})
                     continue
@@ -155,7 +250,6 @@ class Gateway:
                     self._write(writer, {"event": "error", "error": "not ready"})
                     continue
 
-                current_chat_id = chat_id
                 self._clients.setdefault(chat_id, []).append(writer)
 
                 try:
@@ -173,8 +267,10 @@ class Gateway:
         except (ConnectionResetError, asyncio.IncompleteReadError):
             pass
         finally:
-            if current_chat_id:
-                clients = self._clients.get(current_chat_id, [])
+            self._all_writers.discard(writer)
+            self._writer_chat_id.pop(writer_id, None)
+            if bound_chat_id:
+                clients = self._clients.get(bound_chat_id, [])
                 if writer in clients:
                     clients.remove(writer)
             writer.close()
@@ -183,6 +279,14 @@ class Gateway:
     @staticmethod
     def _write(writer: asyncio.StreamWriter, data: dict[str, Any]) -> None:
         writer.write(json.dumps(data, ensure_ascii=False).encode() + b"\n")
+
+    @staticmethod
+    async def _drain_and_close(writer: asyncio.StreamWriter) -> None:
+        try:
+            await writer.drain()
+        except (ConnectionResetError, BrokenPipeError, OSError):
+            pass
+        writer.close()
 
 
 def generate_certs(certs_dir: Path = CERTS_DIR) -> None:

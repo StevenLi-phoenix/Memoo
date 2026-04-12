@@ -16,7 +16,9 @@ logger = logging.getLogger(__name__)
 # All registered commands
 COMMANDS: dict[str, str] = {
     "/help": "Show available commands",
+    "/new": "Start a new conversation (TUI: new session, others: clear + reset)",
     "/clear": "Clear conversation memory for this chat",
+    "/compact": "Compact conversation history (archive old messages, keep recent)",
     "/config": "Show current configuration",
     "/model": "Show or switch the active LLM model",
     "/memory": "Show archived memory summaries",
@@ -39,11 +41,23 @@ async def handle_command(cmd: str, chat_id: str, deps: dict[str, Any]) -> str | 
     if command == "/help":
         return _cmd_help(deps)
 
+    if command == "/new":
+        memory = deps.get("memory")
+        if memory:
+            await memory.clear(chat_id)
+        app = deps.get("app")
+        if app:
+            app._current_topics.pop(chat_id, None)
+        return "New conversation started."
+
     if command == "/clear":
         memory = deps.get("memory")
         if memory:
             await memory.clear(chat_id)
         return "Memory cleared."
+
+    if command == "/compact":
+        return await _cmd_compact(chat_id, deps)
 
     if command == "/config":
         config = deps.get("config")
@@ -179,6 +193,29 @@ def _cmd_model(arg: str, deps: dict[str, Any]) -> str:
             return f"Model switched: `{old}` → `{resolved}`"
 
     return "No default provider configured."
+
+
+async def _cmd_compact(chat_id: str, deps: dict[str, Any]) -> str:
+    app = deps.get("app")
+    if not app:
+        return "Compact not available."
+
+    memory = deps.get("memory")
+    if not memory:
+        return "Memory not available."
+
+    history = await memory.get_history(chat_id)
+    if len(history) < 6:
+        return f"Nothing to compact ({len(history)} messages, need at least 6)."
+
+    try:
+        await app._compact_memory(chat_id)
+        remaining = await memory.get_history(chat_id)
+        archived = len(history) - len(remaining)
+        return f"Compacted: {archived} messages archived, {len(remaining)} kept."
+    except Exception as e:
+        logger.exception("Compact failed for chat_id=%s", chat_id)
+        return f"Compact failed: {e}"
 
 
 async def _cmd_memory(chat_id: str, deps: dict[str, Any]) -> str:

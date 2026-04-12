@@ -6,6 +6,7 @@ sandbox/
 .logs/
 certs/
 .env
+.gateway-token
 *.egg-info/
 dist/
 build/
