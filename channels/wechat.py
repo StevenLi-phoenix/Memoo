@@ -117,7 +117,7 @@ class WeChatChannel:
     async def _get_updates(self) -> list[dict[str, Any]]:
         """Fetch new messages via long-polling."""
         if self._client is None:
-            return
+            return []
         payload: dict[str, Any] = {"timeout": POLL_TIMEOUT}
         if self._cursor:
             payload["get_updates_buf"] = self._cursor

@@ -42,6 +42,27 @@ logger = logging.getLogger("memoo")
 init_crash_handler(logs_dir=".logs", webhook_url=os.environ.get("MEMOO_CRASH_WEBHOOK", ""))
 
 
+def load_memory_files(memory_dir: Path) -> str:
+    """Load all .md files from the memory/ directory for system prompt injection.
+
+    memory/ is a general-purpose knowledge store. Any component (dream, agent,
+    tools, or the user) can write .md files here. All are concatenated and
+    injected into the system prompt at startup.
+    """
+    if not memory_dir.is_dir():
+        return ""
+
+    parts: list[str] = []
+    for md_file in sorted(memory_dir.glob("*.md")):
+        content = md_file.read_text(encoding="utf-8").strip()
+        if content:
+            parts.append(f"## {md_file.stem}\n\n{content}")
+
+    if not parts:
+        return ""
+    return "\n\n---\n\n# Persistent Memory\n\n" + "\n\n".join(parts)
+
+
 def load_system_prompt(prompt_path: str) -> str:
     p = Path(prompt_path)
     if p.exists() and p.is_file():
@@ -96,7 +117,7 @@ def _pick_model(models: list[ModelInfo], preference: str = "") -> str | None:
 
 async def build_llm_registry(
     cfg: AppConfig,
-) -> tuple[LLMProvider, list[LLMProvider], dict[str, list[ModelInfo]]]:
+) -> tuple[LLMProvider, list[LLMProvider], dict[str, list[ModelInfo]], dict[str, LLMProvider]]:
     """Build LLM providers with model discovery from AppConfig."""
     web_search = cfg.tools.web_search
     cache = ModelCache()
@@ -147,7 +168,7 @@ async def build_llm_registry(
     fallback_chain = [built[n] for n in cfg.llm.fallback if n in built and n != default_name]
 
     logger.info("LLM: default=%s (%s), fallbacks=%d", default_name, default_llm.model_name, len(fallback_chain))
-    return default_llm, fallback_chain, all_discovered
+    return default_llm, fallback_chain, all_discovered, built
 
 
 class Memoo:
@@ -158,6 +179,7 @@ class Memoo:
         self.llm: LLMProvider | None = None
         self.fallback_llms: list[LLMProvider] = []
         self.discovered_models: dict[str, list[ModelInfo]] = {}
+        self._providers: dict[str, LLMProvider] = {}
 
         self.memory = Memory(
             db_path=cfg.memory.db_path,
@@ -168,8 +190,17 @@ class Memoo:
         db_dir = str(Path(cfg.memory.db_path).parent)
         self.scheduler = Scheduler(db_path=str(Path(db_dir) / "schedules.db"))
 
-        self.heartbeat = Heartbeat(heartbeat_dir="./heartbeat")
-        self.gateway = Gateway(host=cfg.host, port=cfg.port)
+        self.heartbeat = Heartbeat(
+            heartbeat_dir=cfg.paths.heartbeat_dir,
+            default_interval=cfg.heartbeat.default_interval,
+        )
+        from core.gateway import create_server_ssl
+
+        self.gateway = Gateway(
+            host=cfg.host,
+            port=cfg.port,
+            ssl_ctx=create_server_ssl(host=cfg.host, certs_dir=Path(cfg.paths.certs_dir)),
+        )
         self.tools = ToolRegistry()
         self.hooks = HookRegistry()
         self.hooks.add_hook(sandbox_path_hook)
@@ -183,7 +214,15 @@ class Memoo:
         self._current_topics: dict[str, str] = {}
 
     async def start(self) -> None:
-        self.llm, self.fallback_llms, self.discovered_models = await build_llm_registry(self.cfg)
+        self.llm, self.fallback_llms, self.discovered_models, self._providers = await build_llm_registry(self.cfg)
+
+        # Configure embedding provider
+        from core.embeddings import configure as configure_embeddings
+
+        emb = self.cfg.embedding
+        if not emb.api_key:
+            emb.api_key = os.environ.get("EMBEDDING_API_KEY", "")
+        configure_embeddings(emb)
 
         await self.memory.init()
         await self.scheduler.init()
@@ -191,13 +230,19 @@ class Memoo:
         # Discover skills and inject metadata into system prompt
         from core.skills import SkillRegistry
 
-        self.skill_registry = SkillRegistry(skills_dir=Path("skills"))
+        self.skill_registry = SkillRegistry(skills_dir=Path(self.cfg.paths.skills_dir))
         self.skill_registry.discover()
 
         system_prompt = load_system_prompt(self.cfg.agent.system_prompt)
         skills_section = self.skill_registry.build_system_prompt_section()
         if skills_section:
             system_prompt += "\n" + skills_section
+
+        # Inject knowledge files from memory/ directory
+        memory_context = load_memory_files(Path(self.cfg.paths.memory_dir))
+        if memory_context:
+            system_prompt += "\n" + memory_context
+            logger.info("Memory files injected into system prompt (%d chars)", len(memory_context))
 
         self.agent = Agent(
             llm=self.llm,
@@ -208,6 +253,7 @@ class Memoo:
             hooks=self.hooks,
             memory=self.memory,
             gateway=self.gateway,
+            agent_config=self.cfg.agent,
         )
 
         auto_discover_tools(
@@ -215,9 +261,10 @@ class Memoo:
             deps={
                 "memory": self.memory,
                 "scheduler": self.scheduler,
-                "sandbox_dir": "./sandbox",
+                "sandbox_dir": self.cfg.paths.sandbox_dir,
                 "config": self.cfg,
                 "skill_registry": self.skill_registry,
+                "app": self,
             },
         )
 
@@ -270,18 +317,56 @@ class Memoo:
         if self.agent is None or self.llm is None:
             return "Error: Memoo not initialized"
 
-        MAX_MSG_LEN = 50_000
-        if len(text) > MAX_MSG_LEN:
-            text = text[:MAX_MSG_LEN] + "\n...(truncated)"
+        max_msg_len = self.cfg.agent.max_message_len
+        if len(text) > max_msg_len:
+            text = text[:max_msg_len] + "\n...(truncated)"
             logger.warning("Message truncated: chat_id=%s", chat_id)
 
-        if metadata.get("command") == "clear":
-            await self.memory.clear(chat_id)
-            return "Memory cleared."
+        # Slash commands and skill triggers — handled without LLM call
+        if text.startswith("/"):
+            from core.commands import handle_command
+
+            cmd_result = await handle_command(
+                text,
+                chat_id,
+                deps={
+                    "memory": self.memory,
+                    "config": self.cfg,
+                    "agent": self.agent,
+                    "scheduler": self.scheduler,
+                    "app": self,
+                },
+            )
+            if cmd_result is not None:
+                return cmd_result
+
+            # Not a built-in command — check if it's a skill trigger
+            if self.skill_registry:
+                parts = text.split(maxsplit=1)
+                skill_name = parts[0][1:].lower()
+                meta = self.skill_registry.get_meta(skill_name)
+                if meta:
+                    instructions = self.skill_registry.load_instructions(skill_name) or ""
+                    user_msg = parts[1] if len(parts) > 1 else ""
+                    text = f"[Skill activated: {meta.name}]\n\n{instructions}\n\nUser request: {user_msg}"
+                    logger.info("Skill triggered: %s (chat_id=%s)", skill_name, chat_id)
 
         active = self._active_tasks.get(chat_id)
         if active and not active.done():
-            logger.info("Interrupting active agent for chat_id=%s", chat_id)
+            # Try to inject into active turn instead of hard-cancelling
+            if self.agent.inject(chat_id, text):
+                logger.info("Injected message into active turn for chat_id=%s", chat_id)
+                await self.memory.add_message(chat_id, Message(role="user", content=text, metadata=metadata))
+                try:
+                    result = await active
+                except asyncio.CancelledError:
+                    return "(processing interrupted)"
+                finally:
+                    self._active_tasks.pop(chat_id, None)
+                return await self._finalize_turn(chat_id, result)
+
+            # Injection failed (no inbox) — fall back to cancel
+            logger.info("Inject failed, cancelling active agent for chat_id=%s", chat_id)
             self.agent.cancel(chat_id)
             active.cancel()
             try:
@@ -295,7 +380,7 @@ class Memoo:
 
         context = {
             "chat_id": chat_id,
-            "sandbox_dir": "./sandbox",
+            "sandbox_dir": self.cfg.paths.sandbox_dir,
             "current_topic": self._current_topics.get(chat_id, ""),
             **metadata,
         }
@@ -310,6 +395,10 @@ class Memoo:
         finally:
             self._active_tasks.pop(chat_id, None)
 
+        return await self._finalize_turn(chat_id, result)
+
+    async def _finalize_turn(self, chat_id: str, result: TurnResult) -> str:
+        """Post-turn bookkeeping: persist reply, update topic, compress if needed."""
         await self.memory.add_message(
             chat_id,
             Message(
@@ -328,6 +417,9 @@ class Memoo:
             self._current_topics[chat_id] = result.current_topic
         if result.should_compress:
             await self._compact_memory(chat_id)
+
+        if result.usage:
+            self.gateway.set_reply_extra(chat_id, {"usage": result.usage})
 
         return result.response
 
@@ -367,7 +459,7 @@ class Memoo:
         tokens_so_far = 0
         split_idx = 0
         for i, msg in enumerate(history):
-            tokens_so_far += len(msg.content) // 3
+            tokens_so_far += len(msg.content) // self.cfg.agent.chars_per_token
             if token_count - tokens_so_far <= target_tokens:
                 split_idx = i + 1
                 break
@@ -440,9 +532,7 @@ async def main() -> None:
     await stop_event.wait()
     await app.stop()
 
-    import os as _os
-
-    _os._exit(0)
+    os._exit(0)
 
 
 if __name__ == "__main__":

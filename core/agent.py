@@ -15,15 +15,12 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
+from core.config import AgentConfig
 from core.hooks import HookRegistry
 from core.tools import ToolRegistry, set_context
 from models import LLMProvider, LLMResponse, Message
 
 logger = logging.getLogger(__name__)
-
-HARD_MAX_ROUNDS = 200
-CONTEXT_WINDOW_TOKENS = 128_000  # hard cap — compress when exceeded
-CHARS_PER_TOKEN = 3
 
 # JSON schema for the agent's final structured response
 RESPONSE_SCHEMA: dict[str, Any] = {
@@ -106,6 +103,7 @@ class Agent:
         compressor_llm: LLMProvider | None = None,
         memory: Any = None,
         gateway: Any = None,
+        agent_config: AgentConfig | None = None,
     ) -> None:
         self._llm = llm
         self._tools = tools
@@ -117,7 +115,9 @@ class Agent:
         self._compressor = compressor_llm or (fallback_llms[-1] if fallback_llms else llm)
         self._memory = memory
         self._gateway = gateway  # For streaming tool events to clients
+        self._cfg = agent_config or AgentConfig()
         self._cancel_events: dict[str, asyncio.Event] = {}
+        self._inboxes: dict[str, asyncio.Queue[str]] = {}
         # Cumulative token tracking across all runs
         self.total_tokens: dict[str, int] = {"input_tokens": 0, "output_tokens": 0, "total_runs": 0}
 
@@ -133,6 +133,22 @@ class Agent:
             if self._cancel_events:
                 logger.info("All agent runs cancelled (%d)", len(self._cancel_events))
 
+    def inject(self, run_id: str, text: str) -> bool:
+        """Inject a user message into an active agent turn.
+
+        The message will be appended to the conversation between the current
+        tool execution and the next LLM call, so the LLM sees the correction
+        without restarting the entire turn.
+
+        Returns True if the message was queued, False if no active run exists.
+        """
+        q = self._inboxes.get(run_id)
+        if q is None:
+            return False
+        q.put_nowait(text)
+        logger.info("Message injected into run_id=%s (%d chars)", run_id, len(text))
+        return True
+
     async def run(
         self,
         user_message: str,
@@ -143,9 +159,11 @@ class Agent:
         run_id = str(ctx.get("chat_id", id(asyncio.current_task())))
         cancel_event = asyncio.Event()
         self._cancel_events[run_id] = cancel_event
+        inbox: asyncio.Queue[str] = asyncio.Queue()
+        self._inboxes[run_id] = inbox
 
         try:
-            result = await self._run_loop(user_message, ctx, cancel_event, history)
+            result = await self._run_loop(user_message, ctx, cancel_event, inbox, history)
             # Accumulate token usage
             for k, v in result.usage.items():
                 self.total_tokens[k] = self.total_tokens.get(k, 0) + v
@@ -153,12 +171,14 @@ class Agent:
             return result
         finally:
             self._cancel_events.pop(run_id, None)
+            self._inboxes.pop(run_id, None)
 
     async def _run_loop(
         self,
         user_message: str,
         ctx: dict[str, Any],
         cancel_event: asyncio.Event,
+        inbox: asyncio.Queue[str],
         history: list[Message] | None,
     ) -> TurnResult:
         messages = list(history) if history else []
@@ -180,12 +200,18 @@ class Agent:
 
         tool_schemas = self._tools.get_schemas() or None
         total_usage: dict[str, int] = {"input_tokens": 0, "output_tokens": 0}
+
+        # Expose state for sub-agent spawning and cancel propagation
+        ctx["_messages"] = messages
+        ctx.setdefault("_agent_depth", 0)
+        ctx["_system_prompt"] = self._system_prompt
+        ctx["_cancel_event"] = cancel_event
         set_context(ctx)
         round_num = 0
 
         while True:
             round_num += 1
-            effective_max = self._max_rounds if self._max_rounds > 0 else HARD_MAX_ROUNDS
+            effective_max = self._max_rounds if self._max_rounds > 0 else self._cfg.hard_max_rounds
             if round_num > effective_max:
                 break
             if cancel_event.is_set():
@@ -217,55 +243,71 @@ class Agent:
             # Record assistant turn with tool calls
             messages.append(Message(role="assistant", content=response.text or "", tool_calls=response.tool_calls))
 
-            # Execute tool calls
-            for tc in response.tool_calls:
-                if cancel_event.is_set():
-                    return TurnResult(response="(cancelled during tool execution)", usage=total_usage)
+            # Execute tool calls — parallel if multiple, sequential if single
+            if cancel_event.is_set():
+                return TurnResult(response="(cancelled during tool execution)", usage=total_usage)
 
-                approved, reason = await self._hooks.authorize(tc.name, tc.arguments, ctx)
-                if not approved:
-                    logger.warning("Tool %s denied: %s", tc.name, reason)
-                    messages.append(
-                        Message(role="tool_result", content=f"Authorization denied: {reason}", tool_call_id=tc.id)
-                    )
-                    continue
+            if len(response.tool_calls) > 1:
+                logger.info("Parallel tool execution: %d calls", len(response.tool_calls))
+                results = await asyncio.gather(*[self._execute_one_tool(tc, ctx) for tc in response.tool_calls])
+                for tc, result in zip(response.tool_calls, results):
+                    messages.append(Message(role="tool_result", content=result, tool_call_id=tc.id))
+            else:
+                tc = response.tool_calls[0]
+                result = await self._execute_one_tool(tc, ctx)
+                messages.append(Message(role="tool_result", content=result, tool_call_id=tc.id))
 
-                logger.info("Tool call: %s(id=%s)", tc.name, tc.id)
-
-                # Stream tool_start event to gateway clients
+            # Drain inbox: inject user messages between tool execution and next LLM call
+            injected_count = 0
+            while not inbox.empty():
+                injected_text = inbox.get_nowait()
+                messages.append(Message(role="user", content=injected_text))
+                injected_count += 1
+            if injected_count:
                 chat_id = ctx.get("chat_id", "")
+                logger.info("Injected %d user message(s) mid-turn (chat_id=%s)", injected_count, chat_id)
                 if self._gateway and chat_id:
-                    args_preview = ", ".join(f"{k}={repr(v)[:50]}" for k, v in tc.arguments.items())
-                    self._gateway.send_event(chat_id, {"event": "tool_start", "name": tc.name, "args": args_preview})
-
-                tool_result = await self._tools.execute(tc.name, tc.arguments)
-
-                # Stream tool_done event
-                if self._gateway and chat_id:
-                    ok = "error" not in tool_result[:20].lower()
-                    preview = tool_result.replace("\n", " ")[:120]
-                    self._gateway.send_event(
-                        chat_id, {"event": "tool_done", "name": tc.name, "ok": ok, "result": preview}
-                    )
-
-                messages.append(Message(role="tool_result", content=tool_result, tool_call_id=tc.id))
+                    self._gateway.send_event(chat_id, {"event": "message_injected", "count": injected_count})
 
         # Max rounds exceeded
         logger.warning("Max rounds (%d) exceeded, forcing final answer", effective_max)
         response = await self._chat_with_fallback(messages, tools=None)
         return self._parse_structured_response(response.text or "(max rounds reached)", total_usage)
 
+    async def _execute_one_tool(self, tc: Any, ctx: dict[str, Any]) -> str:
+        """Execute a single tool call with auth check and gateway events."""
+        approved, reason = await self._hooks.authorize(tc.name, tc.arguments, ctx)
+        if not approved:
+            logger.warning("Tool %s denied: %s", tc.name, reason)
+            return f"Authorization denied: {reason}"
+
+        logger.info("Tool call: %s(id=%s)", tc.name, tc.id)
+
+        chat_id = ctx.get("chat_id", "")
+        if self._gateway and chat_id:
+            args_preview = ", ".join(f"{k}={repr(v)[:50]}" for k, v in tc.arguments.items())
+            self._gateway.send_event(chat_id, {"event": "tool_start", "name": tc.name, "args": args_preview})
+
+        result = await self._tools.execute(tc.name, tc.arguments)
+
+        if self._gateway and chat_id:
+            ok = "error" not in result[:20].lower()
+            preview = result.replace("\n", " ")[:120]
+            self._gateway.send_event(chat_id, {"event": "tool_done", "name": tc.name, "ok": ok, "result": preview})
+
+        return result
+
     async def _enforce_context_window(self, messages: list[Message]) -> list[Message]:
-        """Hard cap: if context exceeds CONTEXT_WINDOW_TOKENS, compress in two phases.
+        """Hard cap: if context exceeds self._cfg.context_window_tokens, compress in two phases.
 
         Phase 1: Replace old messages with archived memory summaries (if available).
         Phase 2: If still over budget, strip middle and summarize with cheap LLM.
         """
         total_tokens = self._estimate_tokens(messages)
-        if total_tokens <= CONTEXT_WINDOW_TOKENS:
+        if total_tokens <= self._cfg.context_window_tokens:
             return messages
 
-        logger.warning("Context: %d tokens > %d limit", total_tokens, CONTEXT_WINDOW_TOKENS)
+        logger.warning("Context: %d tokens > %d limit", total_tokens, self._cfg.context_window_tokens)
 
         # --- Phase 1: Replace old messages with archived memory summaries ---
         if self._memory:
@@ -277,7 +319,7 @@ class Agent:
 
         # --- Phase 2: Strip middle, compress with cheap LLM ---
         total_tokens = self._estimate_tokens(messages)
-        if total_tokens <= CONTEXT_WINDOW_TOKENS:
+        if total_tokens <= self._cfg.context_window_tokens:
             return messages
 
         keep_start = min(2, len(messages))
@@ -305,9 +347,8 @@ class Agent:
         logger.info("Phase 2: %d middle msgs -> %d char summary", len(middle), len(summary))
         return head + [Message(role="system", content=f"[Compressed context]: {summary}")] + tail
 
-    @staticmethod
-    def _estimate_tokens(messages: list[Message]) -> int:
-        return sum(len(m.content) for m in messages if m.content) // CHARS_PER_TOKEN
+    def _estimate_tokens(self, messages: list[Message]) -> int:
+        return sum(len(m.content) for m in messages if m.content) // self._cfg.chars_per_token
 
     async def _replace_with_memory(self, messages: list[Message], chat_id: str) -> list[Message]:
         """Phase 1: Replace old verbose messages with archived memory summaries.
@@ -329,13 +370,13 @@ class Agent:
         memory_summary = "Archived conversation history:\n" + "\n".join(summary_parts)
 
         # Keep only recent messages (last N that fit in budget), prepend memory summary
-        target_tokens = int(CONTEXT_WINDOW_TOKENS * 0.7)
+        target_tokens = int(self._cfg.context_window_tokens * 0.7)
         kept: list[Message] = []
-        token_count = len(memory_summary) // CHARS_PER_TOKEN
+        token_count = len(memory_summary) // self._cfg.chars_per_token
 
         # Walk from newest to oldest, keep messages until we hit budget
         for msg in reversed(messages):
-            msg_tokens = len(msg.content) // CHARS_PER_TOKEN if msg.content else 0
+            msg_tokens = len(msg.content) // self._cfg.chars_per_token if msg.content else 0
             if token_count + msg_tokens > target_tokens:
                 break
             kept.insert(0, msg)

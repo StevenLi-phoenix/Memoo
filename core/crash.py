@@ -6,6 +6,8 @@ and optionally reported via webhook or queued for `claude -p` auto-fix.
 
 from __future__ import annotations
 
+import asyncio
+import functools
 import json
 import logging
 import sys
@@ -254,8 +256,9 @@ def crash_boundary(component: str = "") -> Callable[..., Any]:
     """
 
     def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
-        if _is_coroutine(func):
+        if asyncio.iscoroutinefunction(func):
 
+            @functools.wraps(func)
             async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
                 try:
                     return await func(*args, **kwargs)
@@ -269,11 +272,10 @@ def crash_boundary(component: str = "") -> Callable[..., Any]:
                     )
                     raise
 
-            async_wrapper.__name__ = func.__name__
-            async_wrapper.__qualname__ = func.__qualname__
             return async_wrapper
         else:
 
+            @functools.wraps(func)
             def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
                 try:
                     return func(*args, **kwargs)
@@ -287,17 +289,9 @@ def crash_boundary(component: str = "") -> Callable[..., Any]:
                     )
                     raise
 
-            sync_wrapper.__name__ = func.__name__
-            sync_wrapper.__qualname__ = func.__qualname__
             return sync_wrapper
 
     return decorator
-
-
-def _is_coroutine(func: Any) -> bool:
-    import asyncio
-
-    return asyncio.iscoroutinefunction(func)
 
 
 def _summarize_args(args: tuple[Any, ...], kwargs: dict[str, Any]) -> str:

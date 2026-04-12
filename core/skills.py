@@ -12,9 +12,10 @@ Inspired by Anthropic's Agent Skills architecture.
 from __future__ import annotations
 
 import logging
-import re
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from core.utils import parse_frontmatter
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +44,7 @@ class SkillRegistry:
             return
 
         for skill_md in sorted(self.skills_dir.rglob("SKILL.md")):
-            meta = _parse_frontmatter(skill_md)
+            meta = _parse_skill_meta(skill_md)
             if meta:
                 self._skills[meta.name] = meta
                 logger.info("Skill discovered: %s — %s", meta.name, meta.description[:60])
@@ -83,10 +84,10 @@ class SkillRegistry:
             return None
 
         content = skill_md.read_text(encoding="utf-8")
-        # Strip frontmatter
-        stripped = re.sub(r"^---\s*\n.*?\n---\s*\n", "", content, count=1, flags=re.DOTALL)
-        logger.info("Skill loaded (L2): %s (%d chars)", name, len(stripped))
-        return stripped.strip()
+        _, body = parse_frontmatter(content)
+        body = body.strip()
+        logger.info("Skill loaded (L2): %s (%d chars)", name, len(body))
+        return body
 
     def load_resource(self, name: str, resource_path: str) -> str | None:
         """L3: Read a bundled resource file from a skill's directory."""
@@ -120,30 +121,20 @@ class SkillRegistry:
         return resources
 
 
-def _parse_frontmatter(skill_md: Path) -> SkillMeta | None:
-    """Parse YAML frontmatter from SKILL.md."""
+def _parse_skill_meta(skill_md: Path) -> SkillMeta | None:
+    """Parse YAML frontmatter from SKILL.md into SkillMeta."""
     try:
         content = skill_md.read_text(encoding="utf-8")
     except OSError:
         return None
 
-    match = re.match(r"^---\s*\n(.*?)\n---\s*\n", content, re.DOTALL)
-    if not match:
+    meta, _ = parse_frontmatter(content)
+    if not meta:
         logger.warning("No frontmatter in %s, skipping", skill_md)
         return None
 
-    name = ""
-    description = ""
-    for line in match.group(1).split("\n"):
-        if ":" in line:
-            key, val = line.split(":", 1)
-            key = key.strip().lower()
-            val = val.strip()
-            if key == "name":
-                name = val
-            elif key == "description":
-                description = val
-
+    name = meta.get("name", "")
+    description = meta.get("description", "")
     if not name or not description:
         logger.warning("Missing name/description in %s, skipping", skill_md)
         return None

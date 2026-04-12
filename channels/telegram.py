@@ -27,9 +27,15 @@ class TelegramChannel:
         self._handler = handler
         self._app = Application.builder().token(self._token).build()
 
-        # Register handlers
+        # Register handlers — slash commands go through handle_message (server-side)
         self._app.add_handler(CommandHandler("start", self._on_start))
-        self._app.add_handler(CommandHandler("clear", self._on_clear))
+        self._app.add_handler(CommandHandler("help", self._on_command))
+        self._app.add_handler(CommandHandler("clear", self._on_command))
+        self._app.add_handler(CommandHandler("config", self._on_command))
+        self._app.add_handler(CommandHandler("model", self._on_command))
+        self._app.add_handler(CommandHandler("memory", self._on_command))
+        self._app.add_handler(CommandHandler("schedule", self._on_command))
+        self._app.add_handler(CommandHandler("status", self._on_command))
         self._app.add_handler(TGMessageHandler(filters.TEXT & ~filters.COMMAND, self._on_message))
 
         logger.info("Telegram channel starting: mode=%s", self._mode)
@@ -60,14 +66,19 @@ class TelegramChannel:
     async def _on_start(self, update: Update, _context: Any) -> None:
         """Handle /start command."""
         if update.effective_chat:
-            await self.send(str(update.effective_chat.id), "Hi! I'm Memoo. Send me a message.")
+            await self.send(
+                str(update.effective_chat.id), "Hi! I'm Memoo. Send me a message.\nType /help for commands."
+            )
 
-    async def _on_clear(self, update: Update, _context: Any) -> None:
-        """Handle /clear command — signal to clear memory."""
-        if update.effective_chat and self._handler:
-            chat_id = str(update.effective_chat.id)
-            await self._handler(chat_id, "/clear", {"command": "clear"})
-            await self.send(chat_id, "Memory cleared.")
+    async def _on_command(self, update: Update, _context: Any) -> None:
+        """Handle all slash commands — forward to handle_message which routes to core/commands.py."""
+        if not update.message or not update.effective_chat or not self._handler:
+            return
+        chat_id = str(update.effective_chat.id)
+        text = update.message.text or ""
+        response = await self._handler(chat_id, text, {"platform": "telegram"})
+        if response.strip():
+            await self.send(chat_id, response)
 
     async def _on_message(self, update: Update, _context: Any) -> None:
         """Handle incoming text messages."""

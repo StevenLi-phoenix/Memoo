@@ -8,42 +8,18 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable
+
+from core.utils import parse_frontmatter
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_INTERVAL = 3600  # 1 hour
 
 HeartbeatHandler = Callable[[str, dict[str, Any]], Awaitable[str]]
-
-
-def _parse_frontmatter(content: str) -> tuple[dict[str, Any], str]:
-    """Parse YAML-like frontmatter from markdown. Returns (metadata, body)."""
-    match = re.match(r"^---\s*\n(.*?)\n---\s*\n", content, re.DOTALL)
-    if not match:
-        return {}, content
-
-    meta: dict[str, Any] = {}
-    for line in match.group(1).split("\n"):
-        if ":" in line:
-            key, val = line.split(":", 1)
-            key = key.strip()
-            val = val.strip()
-            # Parse int values
-            try:
-                meta[key] = int(val)
-            except ValueError:
-                if val.lower() in ("true", "false"):
-                    meta[key] = val.lower() == "true"
-                else:
-                    meta[key] = val
-
-    body = content[match.end() :]
-    return meta, body
 
 
 class HeartbeatTask:
@@ -59,7 +35,7 @@ class HeartbeatTask:
     @classmethod
     def from_file(cls, path: Path) -> HeartbeatTask:
         content = path.read_text(encoding="utf-8")
-        meta, body = _parse_frontmatter(content)
+        meta, body = parse_frontmatter(content)
         return cls(
             name=meta.get("name", path.stem),
             prompt=body.strip(),

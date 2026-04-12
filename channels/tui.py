@@ -8,6 +8,7 @@ import select
 import sys
 
 from channels import MessageHandler
+from tui import render_markdown
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +33,7 @@ class TUIChannel:
         print("Type your message and press Enter. Type /quit to exit.\n")
 
     async def send(self, chat_id: str, text: str) -> None:
-        print(f"\n\033[36mMemoo:\033[0m {text}\n")
+        print(f"\n\033[1;36mMemoo:\033[0m {render_markdown(text)}\n")
 
     async def stop(self) -> None:
         self._running = False
@@ -64,12 +65,6 @@ class TUIChannel:
                 if text in ("/quit", "/exit"):
                     print("Bye!")
                     break
-
-                if text == "/clear":
-                    if self._handler is not None:
-                        await self._handler(self._chat_id, text, {"command": "clear"})
-                        print("Memory cleared.")
-                    continue
 
                 if self._handler is None:
                     continue

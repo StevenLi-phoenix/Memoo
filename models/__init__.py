@@ -92,11 +92,6 @@ _PROVIDER_REGISTRY: dict[str, tuple[str, str]] = {
 }
 
 
-def register_provider(name: str, module_path: str, class_name: str) -> None:
-    _PROVIDER_REGISTRY[name] = (module_path, class_name)
-    logger.info("Registered provider type: %s -> %s.%s", name, module_path, class_name)
-
-
 def create_provider(provider_type: str, **kwargs: Any) -> LLMProvider:
     if provider_type not in _PROVIDER_REGISTRY:
         available = ", ".join(sorted(_PROVIDER_REGISTRY.keys()))

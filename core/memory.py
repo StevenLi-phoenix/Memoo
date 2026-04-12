@@ -41,6 +41,8 @@ CREATE TABLE IF NOT EXISTS archive (
     summary TEXT NOT NULL,
     full_messages TEXT NOT NULL,  -- JSON: original messages before compaction
     token_count INTEGER NOT NULL DEFAULT 0,
+    importance REAL NOT NULL DEFAULT 0.5,  -- 0.0-1.0 importance score
+    embedding TEXT,  -- JSON-serialized float vector
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_archive_chat_id ON archive(chat_id);
@@ -70,10 +72,11 @@ def estimate_tokens(text: str) -> int:
 
 
 class Memory:
-    """Per-chat conversation memory with archive and RAG retrieval.
+    """Per-chat conversation memory with archive and semantic RAG retrieval.
 
     Active messages: working context for the current conversation.
-    Archive: compacted messages searchable via FTS5 for progressive disclosure.
+    Archive: compacted messages with embeddings for semantic search + FTS5 keyword fallback.
+    Importance scoring: based on message density, tool usage, and topic shifts.
     """
 
     def __init__(
@@ -81,11 +84,13 @@ class Memory:
         db_path: str = "./data/memory.db",
         max_context: int = 200,
         token_window: int = 100_000,
+        embedding_provider: Any = None,
     ) -> None:
         self._db_path = db_path
         self._max_context = max_context
         self._token_window = token_window
         self._db: aiosqlite.Connection | None = None
+        self._embed_provider = embedding_provider
 
     async def init(self) -> None:
         Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
@@ -169,7 +174,7 @@ class Memory:
     # --- Archive (long-term memory) ---
 
     async def archive_messages(self, chat_id: str, messages: list[Message], topic: str, summary: str) -> None:
-        """Archive compacted messages for future RAG retrieval."""
+        """Archive compacted messages with embedding and importance scoring."""
         if self._db is None:
             raise RuntimeError("Memory not initialized — call init() first")
         full_json = json.dumps(
@@ -177,85 +182,116 @@ class Memory:
             ensure_ascii=False,
         )
         token_count = sum(estimate_tokens(m.content) for m in messages if m.content)
+        importance = self._score_importance(messages)
+
+        # Compute embedding for semantic search
+        from core.embeddings import embed_text, serialize_embedding
+
+        embed_input = f"{topic}\n{summary}"
+        vec = await embed_text(embed_input, self._embed_provider)
+        embedding_json = serialize_embedding(vec)
 
         await self._db.execute(
-            "INSERT INTO archive (chat_id, topic, summary, full_messages, token_count) VALUES (?, ?, ?, ?, ?)",
-            (chat_id, topic, summary, full_json, token_count),
+            "INSERT INTO archive (chat_id, topic, summary, full_messages, token_count, importance, embedding)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (chat_id, topic, summary, full_json, token_count, importance, embedding_json),
         )
         await self._db.commit()
-        logger.info("Archived %d messages for chat_id=%s, topic=%s", len(messages), chat_id, topic)
+        logger.info(
+            "Archived %d msgs for chat_id=%s, topic=%s, importance=%.2f", len(messages), chat_id, topic, importance
+        )
+
+    @staticmethod
+    def _score_importance(messages: list[Message]) -> float:
+        """Score importance 0.0-1.0 based on message content signals."""
+        if not messages:
+            return 0.5
+
+        score = 0.5
+        total_content = " ".join(m.content for m in messages if m.content)
+
+        # More messages = more important
+        score += min(0.15, len(messages) * 0.01)
+
+        # Tool usage signals active work
+        tool_msgs = sum(1 for m in messages if m.role == "tool_result")
+        score += min(0.15, tool_msgs * 0.05)
+
+        # Longer conversations = more context worth keeping
+        score += min(0.1, len(total_content) / 50000)
+
+        # Decision/action keywords boost importance
+        action_words = ["decided", "created", "fixed", "installed", "configured", "remember", "important"]
+        hits = sum(1 for w in action_words if w in total_content.lower())
+        score += min(0.1, hits * 0.03)
+
+        return min(1.0, score)
 
     async def search_archive(self, query: str, chat_id: str | None = None, limit: int = 5) -> list[dict[str, Any]]:
-        """RAG search: find relevant archived conversations by keyword.
+        """Hybrid RAG search: semantic (embedding) + keyword (FTS5) + importance scoring.
 
-        Uses FTS5 for full-text search with BM25 ranking.
+        Results are ranked by: 0.5 * semantic_sim + 0.3 * keyword_match + 0.2 * importance
         """
         if self._db is None:
             raise RuntimeError("Memory not initialized — call init() first")
 
-        # Sanitize FTS5 query: escape special chars to prevent query injection
-        # FTS5 operators: AND OR NOT NEAR * ^ "
-        sanitized = query.replace('"', '""')
-        sanitized = f'"{sanitized}"'  # phrase query — disables operator parsing
-
-        try:
-            if chat_id:
-                cursor = await self._db.execute(
-                    """SELECT a.id, a.chat_id, a.topic, a.summary, a.full_messages, a.created_at,
-                              bm25(archive_fts) as rank
-                       FROM archive_fts
-                       JOIN archive a ON a.id = archive_fts.rowid
-                       WHERE archive_fts MATCH ? AND a.chat_id = ?
-                       ORDER BY rank
-                       LIMIT ?""",
-                    (sanitized, chat_id, limit),
-                )
-            else:
-                cursor = await self._db.execute(
-                    """SELECT a.id, a.chat_id, a.topic, a.summary, a.full_messages, a.created_at,
-                              bm25(archive_fts) as rank
-                       FROM archive_fts
-                       JOIN archive a ON a.id = archive_fts.rowid
-                       WHERE archive_fts MATCH ?
-                       ORDER BY rank
-                       LIMIT ?""",
-                    (sanitized, limit),
-                )
-            rows = await cursor.fetchall()
-        except Exception:
-            # Fallback: LIKE-based search if FTS5 not available
-            logger.debug("FTS5 search failed, falling back to LIKE", exc_info=True)
-            like_query = f"%{query}%"
-            _cols = "id, chat_id, topic, summary, full_messages, created_at"
-            if chat_id:
-                cursor = await self._db.execute(
-                    f"SELECT {_cols} FROM archive"
-                    " WHERE chat_id = ? AND (summary LIKE ? OR topic LIKE ?)"
-                    " ORDER BY created_at DESC LIMIT ?",
-                    (chat_id, like_query, like_query, limit),
-                )
-            else:
-                cursor = await self._db.execute(
-                    f"SELECT {_cols} FROM archive"
-                    " WHERE summary LIKE ? OR topic LIKE ?"
-                    " ORDER BY created_at DESC LIMIT ?",
-                    (like_query, like_query, limit),
-                )
-            rows = await cursor.fetchall()
-
-        results: list[dict[str, Any]] = []
-        for row in rows:
-            results.append(
-                {
-                    "id": row[0],
-                    "chat_id": row[1],
-                    "topic": row[2],
-                    "summary": row[3],
-                    "full_messages": row[4],  # JSON string
-                    "created_at": row[5],
-                }
+        # Load all candidate entries for this chat
+        _cols = "id, chat_id, topic, summary, full_messages, created_at, importance, embedding"
+        if chat_id:
+            cursor = await self._db.execute(
+                f"SELECT {_cols} FROM archive WHERE chat_id = ? ORDER BY created_at DESC LIMIT 100",
+                (chat_id,),
             )
-        return results
+        else:
+            cursor = await self._db.execute(f"SELECT {_cols} FROM archive ORDER BY created_at DESC LIMIT 100")
+        rows = await cursor.fetchall()
+
+        if not rows:
+            return []
+
+        # Compute query embedding
+        from core.embeddings import cosine_similarity, deserialize_embedding, embed_text
+
+        query_vec = await embed_text(query, self._embed_provider)
+        query_lower = query.lower()
+
+        # Score each entry
+        scored: list[tuple[float, dict[str, Any]]] = []
+        for row in rows:
+            entry = {
+                "id": row[0],
+                "chat_id": row[1],
+                "topic": row[2],
+                "summary": row[3],
+                "full_messages": row[4],
+                "created_at": row[5],
+            }
+            importance = row[6] or 0.5
+            embedding_json = row[7]
+
+            # Semantic similarity (0.0-1.0)
+            if embedding_json:
+                entry_vec = deserialize_embedding(embedding_json)
+                semantic_score = max(0.0, cosine_similarity(query_vec, entry_vec))
+            else:
+                semantic_score = 0.0
+
+            # Keyword match (0.0 or 1.0)
+            text = f"{entry['topic']} {entry['summary']}".lower()
+            keyword_score = 1.0 if query_lower in text else 0.0
+            # Partial word match
+            if not keyword_score:
+                words = query_lower.split()
+                hits = sum(1 for w in words if w in text)
+                keyword_score = hits / max(len(words), 1)
+
+            # Combined score
+            final = 0.5 * semantic_score + 0.3 * keyword_score + 0.2 * importance
+            scored.append((final, entry))
+
+        # Sort by score descending, take top N
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [entry for _, entry in scored[:limit]]
 
     async def get_archive_entry(self, archive_id: int) -> dict[str, Any] | None:
         """Get a specific archive entry by ID (for agent to read full context)."""
@@ -281,37 +317,54 @@ class Memory:
         """List archived conversation summaries (progressive disclosure — summaries only)."""
         if self._db is None:
             raise RuntimeError("Memory not initialized — call init() first")
+        _cols = "id, chat_id, topic, summary, token_count, created_at"
         if chat_id:
             cursor = await self._db.execute(
-                "SELECT id, topic, summary, token_count, created_at FROM archive"
-                " WHERE chat_id = ? ORDER BY created_at DESC LIMIT ?",
+                f"SELECT {_cols} FROM archive WHERE chat_id = ? ORDER BY created_at DESC LIMIT ?",
                 (chat_id, limit),
             )
         else:
             cursor = await self._db.execute(
-                "SELECT id, chat_id, topic, summary, token_count, created_at"
-                " FROM archive ORDER BY created_at DESC LIMIT ?",
+                f"SELECT {_cols} FROM archive ORDER BY created_at DESC LIMIT ?",
                 (limit,),
             )
         rows = await cursor.fetchall()
 
         results: list[dict[str, Any]] = []
         for row in rows:
-            entry: dict[str, Any] = {"id": row[0]}
-            if chat_id:
-                entry.update({"topic": row[1], "summary": row[2][:100], "tokens": row[3], "date": row[4]})
-            else:
-                entry.update(
-                    {
-                        "chat_id": row[1],
-                        "topic": row[2],
-                        "summary": row[3][:100],
-                        "tokens": row[4],
-                        "date": row[5],
-                    }
-                )
+            entry: dict[str, Any] = {
+                "id": row[0],
+                "topic": row[2],
+                "summary": row[3][:100],
+                "tokens": row[4],
+                "date": row[5],
+            }
+            if not chat_id:
+                entry["chat_id"] = row[1]
             results.append(entry)
         return results
+
+    async def get_archive_since(self, cursor_id: int = 0, limit: int = 30) -> list[dict[str, Any]]:
+        """Get archive entries with id > cursor_id (for dream processing)."""
+        if self._db is None:
+            raise RuntimeError("Memory not initialized — call init() first")
+        rows = await self._db.execute_fetchall(
+            "SELECT id, chat_id, topic, summary, token_count, importance, created_at"
+            " FROM archive WHERE id > ? ORDER BY id ASC LIMIT ?",
+            (cursor_id, limit),
+        )
+        return [
+            {
+                "id": row[0],
+                "chat_id": row[1],
+                "topic": row[2],
+                "summary": row[3],
+                "token_count": row[4],
+                "importance": row[5],
+                "date": row[6],
+            }
+            for row in rows
+        ]
 
     # --- Helpers ---
 

@@ -27,12 +27,6 @@ _CHANNEL_REGISTRY: dict[str, tuple[str, str]] = {
 }
 
 
-def register_channel(name: str, module_path: str, class_name: str) -> None:
-    """Register a new channel type for dynamic loading."""
-    _CHANNEL_REGISTRY[name] = (module_path, class_name)
-    logger.info("Registered channel type: %s -> %s.%s", name, module_path, class_name)
-
-
 def create_channel(channel_type: str, **kwargs: Any) -> Channel:
     """Dynamically create a channel instance by type name."""
     if channel_type not in _CHANNEL_REGISTRY:

@@ -31,3 +31,15 @@ tools:
   read_file: true
   run_code: true
   web_search: true
+
+# Sub-agent spawning
+subagent:
+  max_depth: 3
+  default_max_rounds: 10
+
+# Embedding for semantic memory search
+# provider: local (lm-studio/llama.cpp/mlx/ollama) | openai | off
+embedding:
+  provider: local
+  base_url: http://localhost:1234/v1
+  model: text-embedding-nomic-embed-text-v1.5

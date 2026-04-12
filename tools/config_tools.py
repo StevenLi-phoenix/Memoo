@@ -30,9 +30,11 @@ def register(registry: ToolRegistry, **deps: Any) -> None:
         """Get the current runtime configuration, including LLM providers and their models."""
         return json.dumps(config.to_dict(), indent=2, ensure_ascii=False)
 
+    app = deps.get("app")  # Running Memoo instance for hot-reload
+
     @registry.tool
     def set_model(provider_name: str, model: str) -> str:
-        """Set the model preference for an LLM provider. Validates against discovered models.
+        """Set the model for an LLM provider. Takes effect immediately (hot-reload).
 
         Args:
             provider_name: Provider name (e.g. 'anthropic', 'openai').
@@ -42,30 +44,31 @@ def register(registry: ToolRegistry, **deps: Any) -> None:
 
         for p in config.llm.providers:
             if p.name == provider_name:
-                # Validate against discovered models
                 cache = ModelCache()
                 cached = cache.get(p.provider)
                 if cached:
-                    # Exact match
                     exact = [m for m in cached if m.id == model]
-                    # Substring match
                     matches = exact or [m for m in cached if model in m.id]
                     if not matches:
                         model_ids = [m.id for m in sorted(cached, key=lambda x: x.created, reverse=True)[:10]]
-                        return (
-                            f"Model '{model}' not found for {provider_name}. "
-                            f"Available (newest first): {', '.join(model_ids)}"
-                        )
-                    # Use the best match (exact > newest substring match)
+                        return f"Model '{model}' not found. Available: {', '.join(model_ids)}"
                     resolved = exact[0].id if exact else sorted(matches, key=lambda x: x.created, reverse=True)[0].id
                 else:
-                    resolved = model  # No cache — accept as preference
+                    resolved = model
 
                 old = p.model
                 p.model = resolved
                 config.save()
-                logger.info("Model preference updated: %s: %s -> %s", provider_name, old, resolved)
-                return f"Model for '{provider_name}' set to '{resolved}'. Takes effect on next restart."
+
+                # Hot-reload: update the live provider's model_name
+                if app and hasattr(app, "llm") and app.llm and app.llm.model_name:
+                    if p.name == config.llm.default and hasattr(app.llm, "model_name"):
+                        app.llm.model_name = resolved  # type: ignore[union-attr]
+                        logger.info("Hot-reloaded model: %s -> %s", old, resolved)
+                        return f"Model switched: {old} -> {resolved} (live)"
+
+                logger.info("Model preference: %s: %s -> %s", provider_name, old, resolved)
+                return f"Model set to '{resolved}' for '{provider_name}'."
 
         available = [p.name for p in config.llm.providers]
         return f"Provider '{provider_name}' not found. Available: {', '.join(available)}"

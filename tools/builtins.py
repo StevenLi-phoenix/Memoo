@@ -21,28 +21,12 @@ from core.tools import ToolRegistry
 
 logger = logging.getLogger(__name__)
 
-MAX_OUTPUT = 10000
+_MAX_OUTPUT = 10000  # default, overridden by config.sandbox.max_output at registration
 DEFAULT_EXEC_TIMEOUT = 300  # 5 min default, agent can override per-call
 
-# macOS sandbox-exec profile (SBPL):
-# - Read: anywhere (system libs, binaries, data)
-# - Write: ONLY inside {sandbox_dir} and /dev
-# - Execute: any program
-# - Network: allowed
-_SANDBOX_PROFILE = """
-(version 1)
-(deny default)
-(allow file-read*)
-(allow file-write* (subpath "{sandbox_dir}") (subpath "/dev"))
-(allow process-exec*)
-(allow process-fork)
-(allow sysctl-read)
-(allow mach-lookup)
-(allow mach-register)
-(allow ipc-posix*)
-(allow signal)
-(allow network*)
-"""
+# macOS sandbox-exec profile (SBPL) — built dynamically by _make_profile().
+# Base: read anywhere, execute any program, write ONLY inside sandbox_dir.
+# Flags: readonly (deny file-write except /dev), no_network (deny network).
 
 
 def _check_sandbox_exec() -> None:
@@ -99,21 +83,60 @@ def _safe_env(exec_dir: str) -> dict[str, str]:
     return safe
 
 
-def _make_profile(exec_dir: str) -> str:
-    """Build sandbox profile with the real (resolved) sandbox path."""
+def _make_profile(exec_dir: str, *, readonly: bool = False, no_network: bool = False) -> str:
+    """Build sandbox profile with the real (resolved) sandbox path.
+
+    Args:
+        exec_dir: Session sandbox directory (full write access here by default).
+        readonly: Deny file writes everywhere (commands can still run).
+        no_network: Deny all network access.
+    """
     real_dir = os.path.realpath(exec_dir)
-    return _SANDBOX_PROFILE.format(sandbox_dir=real_dir)
+
+    parts = [
+        "(version 1)",
+        "(deny default)",
+        "(allow file-read*)",
+    ]
+
+    if readonly:
+        # Readonly: only /dev writable (needed for stdout/stderr)
+        parts.append('(allow file-write* (subpath "/dev"))')
+    else:
+        parts.append(f'(allow file-write* (subpath "{real_dir}") (subpath "/dev"))')
+
+    parts.extend(
+        [
+            "(allow process-exec*)",
+            "(allow process-fork)",
+            "(allow sysctl-read)",
+            "(allow mach-lookup)",
+            "(allow mach-register)",
+            "(allow ipc-posix*)",
+            "(allow signal)",
+        ]
+    )
+
+    if not no_network:
+        parts.append("(allow network*)")
+
+    return "\n".join(parts)
 
 
-def _truncate(text: str) -> str:
-    if len(text) > MAX_OUTPUT:
-        return text[:MAX_OUTPUT] + "\n...(truncated)"
+def _truncate(text: str, max_output: int = _MAX_OUTPUT) -> str:
+    if len(text) > max_output:
+        return text[:max_output] + "\n...(truncated)"
     return text
 
 
 def register(registry: ToolRegistry, **deps: Any) -> None:
     """Register built-in tools. Requires macOS sandbox-exec."""
+    global _MAX_OUTPUT
     from core.tools import get_context
+
+    cfg = deps.get("config")
+    if cfg:
+        _MAX_OUTPUT = cfg.sandbox.max_output
 
     base_sandbox = os.path.realpath(deps.get("sandbox_dir", "./sandbox"))
     os.makedirs(base_sandbox, exist_ok=True)
@@ -150,11 +173,24 @@ def register(registry: ToolRegistry, **deps: Any) -> None:
             return f"Unsupported language: {language}. Supported: python, bash"
 
         session_dir = _get_session_dir()
-        profile = _make_profile(session_dir)
+
+        # Sandbox flags from context (set by sub-agent spawning)
+        ctx = get_context()
+        profile = _make_profile(
+            session_dir,
+            readonly=ctx.get("_sandbox_readonly", False),
+            no_network=ctx.get("_sandbox_no_network", False),
+        )
 
         exec_timeout = timeout if timeout > 0 else DEFAULT_EXEC_TIMEOUT
         logger.info(
-            "run_code: lang=%s, session_dir=%s, timeout=%ds, len=%d", language, session_dir, exec_timeout, len(code)
+            "run_code: lang=%s, session_dir=%s, timeout=%ds, len=%d, readonly=%s, no_net=%s",
+            language,
+            session_dir,
+            exec_timeout,
+            len(code),
+            ctx.get("_sandbox_readonly", False),
+            ctx.get("_sandbox_no_network", False),
         )
 
         if language == "python":
@@ -222,6 +258,9 @@ def register(registry: ToolRegistry, **deps: Any) -> None:
             path: Path relative to session sandbox.
             content: Content to write.
         """
+        if get_context().get("_sandbox_readonly"):
+            return "Error: write denied — sandbox is in readonly mode"
+
         session_dir = _get_session_dir()
         try:
             abs_path = _check_sandbox_path(path, session_dir)

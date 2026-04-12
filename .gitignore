@@ -4,7 +4,10 @@ __pycache__/
 data/
 sandbox/
 .logs/
+certs/
 .env
 *.egg-info/
 dist/
 build/
+memory/*.md
+memory/.dream_cursor

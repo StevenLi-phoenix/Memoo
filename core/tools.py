@@ -16,6 +16,7 @@ from __future__ import annotations
 import inspect
 import json
 import logging
+import types
 from contextvars import ContextVar
 from typing import Any, Callable, get_type_hints
 
@@ -58,7 +59,7 @@ def _python_type_to_json_schema(py_type: type) -> dict[str, Any]:
         return {"type": "object"}
 
     # Union types (e.g. str | None)
-    if origin is type(str | None):
+    if isinstance(py_type, types.UnionType):
         args = [a for a in py_type.__args__ if a is not type(None)]
         if len(args) == 1:
             return _python_type_to_json_schema(args[0])
@@ -166,6 +167,16 @@ class ToolRegistry:
             error = f"Tool {name} failed: {e}"
             logger.error("Tool FAIL: %s -> %s", name, e)
             return json.dumps({"error": error})
+
+    def filtered(self, *, exclude: set[str] | None = None) -> ToolRegistry:
+        """Create a new registry with specified tools excluded."""
+        new = ToolRegistry()
+        for name in self._tools:
+            if exclude and name in exclude:
+                continue
+            new._tools[name] = self._tools[name]
+            new._schemas[name] = self._schemas[name]
+        return new
 
     @property
     def tool_names(self) -> list[str]:
