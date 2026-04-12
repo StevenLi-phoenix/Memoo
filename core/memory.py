@@ -18,7 +18,7 @@ from models import Message, ToolCall
 
 logger = logging.getLogger(__name__)
 
-CHARS_PER_TOKEN = 3
+DEFAULT_CHARS_PER_TOKEN = 3
 
 _INIT_SQL = """
 CREATE TABLE IF NOT EXISTS messages (
@@ -67,8 +67,8 @@ END;
 """
 
 
-def estimate_tokens(text: str) -> int:
-    return len(text) // CHARS_PER_TOKEN
+def estimate_tokens(text: str, chars_per_token: int = DEFAULT_CHARS_PER_TOKEN) -> int:
+    return len(text) // chars_per_token
 
 
 class Memory:
@@ -85,12 +85,14 @@ class Memory:
         max_context: int = 200,
         token_window: int = 100_000,
         embedding_provider: Any = None,
+        chars_per_token: int = DEFAULT_CHARS_PER_TOKEN,
     ) -> None:
         self._db_path = db_path
         self._max_context = max_context
         self._token_window = token_window
         self._db: aiosqlite.Connection | None = None
         self._embed_provider = embedding_provider
+        self._chars_per_token = chars_per_token
 
     async def init(self) -> None:
         Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
@@ -162,7 +164,7 @@ class Memory:
             raise RuntimeError("Memory not initialized — call init() first")
         cursor = await self._db.execute("SELECT SUM(LENGTH(content)) FROM messages WHERE chat_id = ?", (chat_id,))
         row = await cursor.fetchone()
-        return (row[0] if row and row[0] else 0) // CHARS_PER_TOKEN
+        return (row[0] if row and row[0] else 0) // self._chars_per_token
 
     def needs_compaction(self, token_count: int) -> bool:
         return token_count > self._token_window
@@ -173,6 +175,36 @@ class Memory:
         await self._db.execute("DELETE FROM messages WHERE chat_id = ?", (chat_id,))
         await self._db.commit()
         logger.info("Cleared active memory for chat_id=%s", chat_id)
+
+    async def compact_replace(self, chat_id: str, new_messages: list[Message]) -> None:
+        """Atomically replace all active messages for a chat_id.
+
+        Deletes existing messages and inserts new_messages in a single
+        transaction. If any step fails, all changes are rolled back —
+        no data loss.
+        """
+        if self._db is None:
+            raise RuntimeError("Memory not initialized — call init() first")
+        try:
+            await self._db.execute("DELETE FROM messages WHERE chat_id = ?", (chat_id,))
+            for msg in new_messages:
+                tool_calls_json = (
+                    json.dumps([{"id": tc.id, "name": tc.name, "arguments": tc.arguments} for tc in msg.tool_calls])
+                    if msg.tool_calls
+                    else None
+                )
+                metadata_json = json.dumps(msg.metadata) if msg.metadata else None
+                await self._db.execute(
+                    "INSERT INTO messages (chat_id, role, content, tool_call_id, tool_calls, metadata)"
+                    " VALUES (?, ?, ?, ?, ?, ?)",
+                    (chat_id, msg.role, msg.content, msg.tool_call_id, tool_calls_json, metadata_json),
+                )
+            await self._db.commit()
+            logger.info("Atomic compact_replace for chat_id=%s: %d messages", chat_id, len(new_messages))
+        except Exception:
+            await self._db.rollback()
+            logger.exception("compact_replace failed for chat_id=%s — rolled back, no data lost", chat_id)
+            raise
 
     async def message_count(self, chat_id: str) -> int:
         if self._db is None:
@@ -191,7 +223,7 @@ class Memory:
             [{"role": m.role, "content": m.content} for m in messages if m.content],
             ensure_ascii=False,
         )
-        token_count = sum(estimate_tokens(m.content) for m in messages if m.content)
+        token_count = sum(estimate_tokens(m.content, self._chars_per_token) for m in messages if m.content)
         importance = self._score_importance(messages)
 
         # Compute embedding for semantic search

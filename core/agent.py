@@ -121,6 +121,11 @@ class Agent:
         # Cumulative token tracking across all runs
         self.total_tokens: dict[str, int] = {"input_tokens": 0, "output_tokens": 0, "total_runs": 0}
 
+    @property
+    def compressor(self) -> LLMProvider:
+        """Cheap/fast LLM used for summarization and compression tasks."""
+        return self._compressor
+
     def cancel(self, run_id: str | None = None) -> None:
         if run_id is not None:
             ev = self._cancel_events.get(run_id)
@@ -267,7 +272,7 @@ class Agent:
                 chat_id = ctx.get("chat_id", "")
                 logger.info("Injected %d user message(s) mid-turn (chat_id=%s)", injected_count, chat_id)
                 if self._gateway and chat_id:
-                    self._gateway.send_event(chat_id, {"event": "message_injected", "count": injected_count})
+                    await self._gateway.send_event(chat_id, {"event": "message_injected", "count": injected_count})
 
         # Max rounds exceeded
         logger.warning("Max rounds (%d) exceeded, forcing final answer", effective_max)
@@ -286,14 +291,15 @@ class Agent:
         chat_id = ctx.get("chat_id", "")
         if self._gateway and chat_id:
             args_preview = ", ".join(f"{k}={repr(v)[:50]}" for k, v in tc.arguments.items())
-            self._gateway.send_event(chat_id, {"event": "tool_start", "name": tc.name, "args": args_preview})
+            await self._gateway.send_event(chat_id, {"event": "tool_start", "name": tc.name, "args": args_preview})
 
         result = await self._tools.execute(tc.name, tc.arguments)
 
         if self._gateway and chat_id:
             ok = "error" not in result[:20].lower()
             preview = result.replace("\n", " ")[:120]
-            self._gateway.send_event(chat_id, {"event": "tool_done", "name": tc.name, "ok": ok, "result": preview})
+            event = {"event": "tool_done", "name": tc.name, "ok": ok, "result": preview}
+            await self._gateway.send_event(chat_id, event)
 
         return result
 

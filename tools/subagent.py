@@ -68,7 +68,7 @@ class SubagentEventCollector:
     def __init__(self, events: list[dict[str, Any]]) -> None:
         self._events = events
 
-    def send_event(self, chat_id: str, event: dict[str, Any]) -> None:
+    async def send_event(self, chat_id: str, event: dict[str, Any]) -> None:
         self._events.append(event)
 
     def set_reply_extra(self, chat_id: str, extra: dict[str, Any]) -> None:

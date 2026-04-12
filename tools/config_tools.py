@@ -28,7 +28,7 @@ def register(registry: ToolRegistry, **deps: Any) -> None:
     @registry.tool
     def get_config() -> str:
         """Get the current runtime configuration, including LLM providers and their models."""
-        return json.dumps(config.to_dict(), indent=2, ensure_ascii=False)
+        return json.dumps(config.to_display_dict(), indent=2, ensure_ascii=False)
 
     app = deps.get("app")  # Running Memoo instance for hot-reload
 

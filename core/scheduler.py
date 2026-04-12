@@ -228,8 +228,12 @@ class Scheduler:
                 except asyncio.TimeoutError:
                     pass  # timer expired, fire the tasks
 
-            # Execute due tasks
-            for task in tasks:
+            # Execute due tasks concurrently and track elapsed time
+            import time
+
+            fire_time = time.monotonic()
+
+            async def _run_task(task: dict[str, Any]) -> None:
                 logger.info("Firing scheduled task: %s", task["name"])
                 try:
                     response = await handler(task["chat_id"], task["prompt"], task["channel"])
@@ -237,5 +241,11 @@ class Scheduler:
                 except Exception as e:
                     report_crash(e, context={"task": task["name"]}, component="scheduler")
 
-            # Brief sleep to avoid re-firing the same minute
-            await asyncio.sleep(60)
+            await asyncio.gather(*[_run_task(t) for t in tasks])
+
+            # Sleep the remainder of 60 seconds, anchored to fire time.
+            # This prevents drift: even if tasks collectively take 45s,
+            # we still check for the next minute boundary correctly.
+            elapsed = time.monotonic() - fire_time
+            cooldown = max(1.0, 60.0 - elapsed)
+            await asyncio.sleep(cooldown)

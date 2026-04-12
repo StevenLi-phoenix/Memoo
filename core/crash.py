@@ -220,25 +220,40 @@ def _queue_autofix(report: dict[str, Any]) -> None:
 
 
 def _try_webhook(report: dict[str, Any]) -> None:
-    """Best-effort webhook notification (non-blocking)."""
+    """Best-effort webhook notification — non-blocking in async contexts.
+
+    When called from an async context (scheduler, agent, heartbeat), the HTTP
+    request is dispatched to a thread pool via run_in_executor so it doesn't
+    block the event loop. Falls back to synchronous when no loop is running
+    (e.g., from sys.excepthook).
+    """
     if not _webhook_url:
         return
+
+    payload = {
+        "id": report["id"],
+        "error_type": report["error_type"],
+        "error_message": report["error_message"],
+        "component": report["component"],
+        "timestamp": report["timestamp"],
+    }
+
+    try:
+        loop = asyncio.get_running_loop()
+        # Event loop is running — offload to thread pool (fire-and-forget)
+        loop.run_in_executor(None, _sync_webhook_post, payload)
+    except RuntimeError:
+        # No event loop — we're in a sync context (e.g., sys.excepthook), call directly
+        _sync_webhook_post(payload)
+
+
+def _sync_webhook_post(payload: dict[str, Any]) -> None:
+    """Synchronous HTTP POST — runs in thread pool when called from async contexts."""
     try:
         import httpx
 
-        # Sync client for simplicity — this is called from exception handlers
         with httpx.Client(timeout=5) as client:
-            client.post(
-                _webhook_url,
-                json={
-                    "id": report["id"],
-                    "error_type": report["error_type"],
-                    "error_message": report["error_message"],
-                    "component": report["component"],
-                    "timestamp": report["timestamp"],
-                },
-                headers=_webhook_headers,
-            )
+            client.post(_webhook_url, json=payload, headers=_webhook_headers)
     except Exception:
         logger.debug("Webhook notification failed", exc_info=True)
 

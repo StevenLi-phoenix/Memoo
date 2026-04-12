@@ -184,7 +184,10 @@ class Memoo:
     """Main application orchestrator. Agent is the central hub."""
 
     def __init__(self, cfg: AppConfig) -> None:
+        import time
+
         self.cfg = cfg
+        self._start_time = time.monotonic()
         self.llm: LLMProvider | None = None
         self.fallback_llms: list[LLMProvider] = []
         self.discovered_models: dict[str, list[ModelInfo]] = {}
@@ -194,6 +197,7 @@ class Memoo:
             db_path=cfg.memory.db_path,
             max_context=cfg.memory.max_context_messages,
             token_window=cfg.memory.token_window,
+            chars_per_token=cfg.agent.chars_per_token,
         )
 
         db_dir = str(Path(cfg.memory.db_path).parent)
@@ -221,6 +225,7 @@ class Memoo:
         self._channel_map: dict[str, Any] = {}
         self._active_tasks: dict[str, asyncio.Task[TurnResult]] = {}
         self._current_topics: dict[str, str] = {}
+        self._chat_locks: dict[str, asyncio.Lock] = {}  # per-chat_id serialization
 
     async def start(self) -> None:
         self.llm, self.fallback_llms, self.discovered_models, self._providers = await build_llm_registry(self.cfg)
@@ -377,9 +382,10 @@ class Memoo:
                     text = f"[Skill activated: {meta.name}]\n\n{instructions}\n\nUser request: {user_msg}"
                     logger.info("Skill triggered: %s (chat_id=%s)", skill_name, chat_id)
 
+        # Fast path: inject into an already-running turn (no lock needed).
+        # The injector does NOT finalize — the task owner handles that.
         active = self._active_tasks.get(chat_id)
         if active and not active.done():
-            # Try to inject into active turn instead of hard-cancelling
             if self.agent.inject(chat_id, text):
                 logger.info("Injected message into active turn for chat_id=%s", chat_id)
                 await self.memory.add_message(chat_id, Message(role="user", content=text, metadata=metadata))
@@ -387,41 +393,58 @@ class Memoo:
                     result = await active
                 except asyncio.CancelledError:
                     return "(processing interrupted)"
-                finally:
-                    self._active_tasks.pop(chat_id, None)
-                return await self._finalize_turn(chat_id, result)
+                # Return response only — the task creator will call _finalize_turn
+                return result.response
 
-            # Injection failed (no inbox) — fall back to cancel
-            logger.info("Inject failed, cancelling active agent for chat_id=%s", chat_id)
-            self.agent.cancel(chat_id)
-            active.cancel()
+        # Serialize the create-task path per chat_id to prevent two handlers
+        # from both creating tasks and both calling _finalize_turn.
+        lock = self._chat_locks.setdefault(chat_id, asyncio.Lock())
+        async with lock:
+            # Re-check: another handler may have created a task while we waited
+            active = self._active_tasks.get(chat_id)
+            if active and not active.done():
+                # Inject (now under lock, safe) or cancel
+                if self.agent.inject(chat_id, text):
+                    logger.info("Injected message (post-lock) for chat_id=%s", chat_id)
+                    await self.memory.add_message(chat_id, Message(role="user", content=text, metadata=metadata))
+                    try:
+                        result = await active
+                    except asyncio.CancelledError:
+                        return "(processing interrupted)"
+                    return result.response
+
+                logger.info("Inject failed, cancelling active agent for chat_id=%s", chat_id)
+                self.agent.cancel(chat_id)
+                active.cancel()
+                try:
+                    await active
+                except asyncio.CancelledError:
+                    pass
+                await self.memory.add_message(
+                    chat_id, Message(role="assistant", content="(interrupted by new message)")
+                )
+
+            history = await self.memory.get_history(chat_id)
+            await self.memory.add_message(chat_id, Message(role="user", content=text, metadata=metadata))
+
+            context = {
+                "chat_id": chat_id,
+                "sandbox_dir": self.cfg.paths.sandbox_dir,
+                "current_topic": self._current_topics.get(chat_id, ""),
+                **metadata,
+            }
+
+            task = asyncio.create_task(self.agent.run(text, history=history, context=context))
+            self._active_tasks[chat_id] = task
+
             try:
-                await active
+                result = await task
             except asyncio.CancelledError:
-                pass
-            await self.memory.add_message(chat_id, Message(role="assistant", content="(interrupted by new message)"))
+                return "(processing interrupted)"
+            finally:
+                self._active_tasks.pop(chat_id, None)
 
-        history = await self.memory.get_history(chat_id)
-        await self.memory.add_message(chat_id, Message(role="user", content=text, metadata=metadata))
-
-        context = {
-            "chat_id": chat_id,
-            "sandbox_dir": self.cfg.paths.sandbox_dir,
-            "current_topic": self._current_topics.get(chat_id, ""),
-            **metadata,
-        }
-
-        task = asyncio.create_task(self.agent.run(text, history=history, context=context))
-        self._active_tasks[chat_id] = task
-
-        try:
-            result = await task
-        except asyncio.CancelledError:
-            return "(processing interrupted)"
-        finally:
-            self._active_tasks.pop(chat_id, None)
-
-        return await self._finalize_turn(chat_id, result)
+            return await self._finalize_turn(chat_id, result)
 
     async def _finalize_turn(self, chat_id: str, result: TurnResult) -> str:
         """Post-turn bookkeeping: persist reply, update topic, compress if needed."""
@@ -498,7 +521,10 @@ class Memoo:
         old_messages = history[:split_idx]
         old_text = "\n".join(f"[{m.role}]: {m.content}" for m in old_messages if m.content)
 
-        summary_response = await self.llm.chat(
+        # Use the cheap compressor model (e.g. Haiku) for summarization — same as
+        # Agent._enforce_context_window. Falls back to primary model if unavailable.
+        compressor = self.agent.compressor if self.agent else self.llm
+        summary_response = await compressor.chat(
             messages=[
                 Message(
                     role="user",
@@ -514,19 +540,14 @@ class Memoo:
         await self.memory.archive_messages(chat_id=chat_id, messages=old_messages, topic=current_topic, summary=summary)
         logger.info("Compacted chat_id=%s: archived %d msgs, %d tokens freed", chat_id, split_idx, tokens_so_far)
 
-        await self.memory.clear(chat_id)
-        await self.memory.add_message(
-            chat_id,
-            Message(
-                role="system",
-                content=(
-                    f"[Conversation summary — topic: {current_topic}]: {summary}\n\n"
-                    "(Use search_memory to retrieve full archived conversations.)"
-                ),
+        summary_msg = Message(
+            role="system",
+            content=(
+                f"[Conversation summary — topic: {current_topic}]: {summary}\n\n"
+                "(Use search_memory to retrieve full archived conversations.)"
             ),
         )
-        for msg in history[split_idx:]:
-            await self.memory.add_message(chat_id, msg)
+        await self.memory.compact_replace(chat_id, [summary_msg] + history[split_idx:])
 
     async def stop(self) -> None:
         logger.info("Shutting down Memoo...")

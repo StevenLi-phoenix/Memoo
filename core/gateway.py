@@ -153,14 +153,17 @@ class Gateway:
 
         logger.info("Gateway stopped")
 
-    def send_event(self, chat_id: str, event: dict[str, Any]) -> None:
+    async def send_event(self, chat_id: str, event: dict[str, Any]) -> None:
         writers = self._clients.get(chat_id, [])
         line = json.dumps(event, ensure_ascii=False).encode() + b"\n"
         for w in writers:
             try:
                 w.write(line)
-            except Exception:
+                await w.drain()
+            except (ConnectionResetError, BrokenPipeError, OSError):
                 pass
+            except Exception:
+                logger.debug("send_event error for chat_id=%s: %s", chat_id, event.get("event"))
 
     async def _on_connect(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         addr = writer.get_extra_info("peername")

@@ -92,6 +92,15 @@ def make_rate_limit_hook(max_per_minute: int = 30, window_seconds: int = 60) -> 
             return False, f"Rate limit exceeded: {tool_name} ({max_per_minute}/{window_seconds}s)"
 
         calls.append(now)
+
+        # Periodically sweep stale keys to prevent unbounded memory growth.
+        # A key becomes stale when all its timestamps have expired and no new
+        # calls arrive — the owning chat_id or tool may be long gone.
+        if len(_rate_limit_state) > 50:
+            stale = [k for k, v in _rate_limit_state.items() if all(now - t >= window_seconds for t in v)]
+            for k in stale:
+                del _rate_limit_state[k]
+
         return True, "allowed"
 
     return rate_limit_hook

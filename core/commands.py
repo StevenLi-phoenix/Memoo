@@ -62,7 +62,7 @@ async def handle_command(cmd: str, chat_id: str, deps: dict[str, Any]) -> str | 
     if command == "/config":
         config = deps.get("config")
         if config:
-            return "```\n" + json.dumps(config.to_dict(), indent=2, ensure_ascii=False) + "\n```"
+            return "```\n" + json.dumps(config.to_display_dict(), indent=2, ensure_ascii=False) + "\n```"
         return "Config not available."
 
     if command == "/model":
@@ -78,7 +78,7 @@ async def handle_command(cmd: str, chat_id: str, deps: dict[str, Any]) -> str | 
         return await _cmd_dream(deps)
 
     if command == "/status":
-        return _cmd_status(deps)
+        return await _cmd_status(deps)
 
     # Check if it's a skill trigger — let it fall through to agent
     if command.startswith("/"):
@@ -259,35 +259,96 @@ async def _cmd_schedule(deps: dict[str, Any]) -> str:
     return f"**Scheduled Tasks**\n\n{result}"
 
 
-def _cmd_status(deps: dict[str, Any]) -> str:
+async def _cmd_status(deps: dict[str, Any]) -> str:
+    import time
+
     app = deps.get("app")
     agent = deps.get("agent")
 
     lines = ["**Memoo Status**", ""]
 
+    # Uptime
+    if app and hasattr(app, "_start_time"):
+        elapsed = time.monotonic() - app._start_time
+        lines.append(f"  Uptime: {_format_duration(elapsed)}")
+
+    # Model info
     if app and hasattr(app, "llm") and app.llm:
         lines.append(f"  Model: `{app.llm.model_name}`")
+        if agent:
+            compressor_name = getattr(agent.compressor, "model_name", "same as primary")
+            if compressor_name != app.llm.model_name:
+                lines.append(f"  Compressor: `{compressor_name}`")
 
+    # Token usage
     if agent:
         tokens = getattr(agent, "total_tokens", {})
-        lines.append(f"  Total runs: {tokens.get('total_runs', 0)}")
-        lines.append(f"  Input tokens: {tokens.get('input_tokens', 0):,}")
-        lines.append(f"  Output tokens: {tokens.get('output_tokens', 0):,}")
+        total_runs = tokens.get("total_runs", 0)
+        input_t = tokens.get("input_tokens", 0)
+        output_t = tokens.get("output_tokens", 0)
+        lines.append(f"  Runs: {total_runs}")
+        lines.append(f"  Tokens: {input_t + output_t:,} (in={input_t:,}, out={output_t:,})")
         cache_read = tokens.get("cache_read_tokens", 0)
         cache_create = tokens.get("cache_creation_tokens", 0)
         if cache_read or cache_create:
-            lines.append(f"  Cache: read={cache_read:,}, created={cache_create:,}")
+            hit_rate = cache_read / max(input_t, 1) * 100
+            lines.append(f"  Cache: read={cache_read:,}, created={cache_create:,} ({hit_rate:.0f}% hit rate)")
 
+    # Memory stats
+    memory = deps.get("memory")
+    if memory:
+        lines.append("")
+        lines.append("**Memory**")
+        try:
+            # Count active messages across known chats
+            active_chats: dict[str, int] = {}
+            if app and hasattr(app, "_current_topics"):
+                for cid in app._current_topics:
+                    count = await memory.message_count(cid)
+                    if count:
+                        active_chats[cid] = count
+            total_active = sum(active_chats.values())
+            lines.append(f"  Active messages: {total_active} across {len(active_chats)} chat(s)")
+
+            archive_entries = await memory.list_archive(limit=100)
+            lines.append(f"  Archive entries: {len(archive_entries)}")
+        except Exception:
+            lines.append("  (stats unavailable)")
+
+    # Infrastructure
     if app:
+        lines.append("")
+        lines.append("**Infrastructure**")
         channels = list(getattr(app, "_channel_map", {}).keys())
-        # Include TUI/gateway clients
         gateway = getattr(app, "gateway", None)
+        gw_count = 0
         if gateway:
-            gw_clients = getattr(gateway, "_clients", {})
-            for gw_id in gw_clients:
-                if gw_id not in channels:
-                    channels.append(f"tui:{gw_id}")
-        lines.append(f"  Channels: {channels}")
-        lines.append(f"  Tools: {len(getattr(app, 'tools', None).tool_names) if hasattr(app, 'tools') else '?'}")
+            gw_count = len(getattr(gateway, "_all_writers", set()))
+        lines.append(f"  Channels: {', '.join(channels) if channels else 'none'}")
+        lines.append(f"  Gateway clients: {gw_count}")
+        tools = getattr(app, "tools", None)
+        lines.append(f"  Tools: {len(tools.tool_names) if tools else '?'}")
+
+        scheduler = deps.get("scheduler")
+        if scheduler:
+            sched_result = await scheduler.list_schedules()
+            sched_count = sched_result.count("\n") if sched_result != "No scheduled tasks." else 0
+            lines.append(f"  Scheduled tasks: {sched_count}")
 
     return "\n".join(lines)
+
+
+def _format_duration(seconds: float) -> str:
+    """Format seconds into a human-readable duration string."""
+    s = int(seconds)
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m {s % 60}s"
+    h = s // 3600
+    m = (s % 3600) // 60
+    if h < 24:
+        return f"{h}h {m}m"
+    d = h // 24
+    h = h % 24
+    return f"{d}d {h}h {m}m"

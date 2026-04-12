@@ -364,25 +364,76 @@ def _apply_dream_results(
 
 
 def _parse_json(text: str) -> dict[str, Any] | None:
-    """Extract first JSON object from LLM response."""
+    """Extract first JSON object from LLM response.
+
+    Handles common LLM wrapping patterns:
+    1. Pure JSON
+    2. Markdown fenced code blocks (```json ... ```)
+    3. Leading prose before the JSON object
+
+    The brace-depth scanner correctly skips braces inside JSON string
+    literals (including escaped quotes).
+    """
+    if not text:
+        return None
+
+    # Attempt 1: raw text is valid JSON
     try:
-        return json.loads(text)
+        result = json.loads(text)
+        if isinstance(result, dict):
+            return result
     except (json.JSONDecodeError, TypeError):
         pass
 
+    # Attempt 2: strip markdown fences (```json ... ``` or ``` ... ```)
+    import re
+
+    fence_match = re.search(r"```(?:json)?\s*\n?(.*?)```", text, re.DOTALL)
+    if fence_match:
+        try:
+            result = json.loads(fence_match.group(1).strip())
+            if isinstance(result, dict):
+                return result
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    # Attempt 3: find first { and scan with string-aware brace counting
     start = text.find("{")
     if start == -1:
         return None
 
     depth = 0
+    in_string = False
+    escape = False
     for i in range(start, len(text)):
-        if text[i] == "{":
+        ch = text[i]
+        if escape:
+            escape = False
+            continue
+        if ch == "\\":
+            if in_string:
+                escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == "{":
             depth += 1
-        elif text[i] == "}":
+        elif ch == "}":
             depth -= 1
             if depth == 0:
                 try:
                     return json.loads(text[start : i + 1])
                 except json.JSONDecodeError:
-                    return None
+                    # This slice wasn't valid — keep scanning for another object
+                    start = text.find("{", i + 1)
+                    if start == -1:
+                        return None
+                    depth = 0
+                    # Reset loop — we'll pick up at the new start on next iteration
+                    # by adjusting i; but since we can't easily reset a range(),
+                    # use a recursive call for simplicity
+                    return _parse_json(text[i + 1 :])
     return None

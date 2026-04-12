@@ -249,8 +249,16 @@ class AppConfig:
         Path(self._path).write_text(yaml.dump(data, default_flow_style=False, allow_unicode=True), encoding="utf-8")
         logger.info("Config saved to %s", self._path)
 
+    def to_display_dict(self) -> dict[str, Any]:
+        """Serialize for LLM/user display — sensitive fields redacted."""
+        d = self.to_dict()
+        # Redact secrets from display
+        if d.get("embedding", {}).get("api_key"):
+            d["embedding"]["api_key"] = "***"
+        return d
+
     def to_dict(self) -> dict[str, Any]:
-        """Serialize to dict for display — exposed to LLM via get_config tool."""
+        """Full serialization including sensitive fields — used by save()."""
         return {
             "host": self.host,
             "port": self.port,
@@ -293,6 +301,7 @@ class AppConfig:
                 "provider": self.embedding.provider,
                 "base_url": self.embedding.base_url,
                 "model": self.embedding.model,
+                "api_key": self.embedding.api_key,
             },
             "subagent": {
                 "max_depth": self.subagent.max_depth,

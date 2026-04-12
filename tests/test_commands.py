@@ -1,6 +1,8 @@
 """Tests for slash command routing."""
 
-from core.commands import COMMANDS, handle_command
+import pytest
+
+from core.commands import COMMANDS, _format_duration, handle_command
 
 
 class TestCommands:
@@ -37,6 +39,29 @@ class TestCommands:
         assert result is not None
         assert "Memoo Status" in result
 
+    async def test_status_with_uptime(self):
+        import time
+
+        class MockApp:
+            _start_time = time.monotonic() - 3661  # 1h 1m 1s ago
+            llm = None
+
+        result = await handle_command("/status", "test", {"app": MockApp()})
+        assert "Uptime:" in result
+        assert "1h 1m" in result
+
+    async def test_status_with_agent_tokens(self):
+        class MockAgent:
+            total_tokens = {"total_runs": 5, "input_tokens": 1000, "output_tokens": 500}
+
+            @property
+            def compressor(self):
+                return type("M", (), {"model_name": "haiku"})()
+
+        result = await handle_command("/status", "test", {"agent": MockAgent()})
+        assert "Runs: 5" in result
+        assert "1,500" in result  # total tokens
+
     async def test_config_no_deps(self):
         result = await handle_command("/config", "test", {})
         assert result == "Config not available."
@@ -54,3 +79,19 @@ class TestCommands:
         # Doesn't start with / so handle_command should not match
         # Actually it does start processing... let me check
         assert result is None
+
+
+class TestFormatDuration:
+    @pytest.mark.parametrize(
+        "seconds, expected",
+        [
+            (30, "30s"),
+            (90, "1m 30s"),
+            (3600, "1h 0m"),
+            (3661, "1h 1m"),
+            (86400, "1d 0h 0m"),
+            (90061, "1d 1h 1m"),
+        ],
+    )
+    def test_format_duration(self, seconds: float, expected: str) -> None:
+        assert _format_duration(seconds) == expected
