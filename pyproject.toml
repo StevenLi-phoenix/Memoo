@@ -1,0 +1,35 @@
+[project]
+name = "memoo"
+version = "0.1.0"
+description = "Lightweight personal AI agent bot, inspired by NanoClaw"
+requires-python = ">=3.12"
+dependencies = [
+    "anthropic>=0.52.0",
+    "openai>=1.82.0",
+    "python-telegram-bot>=21.12",
+    "pyyaml>=6.0",
+    "aiosqlite>=0.21.0",
+    "python-dotenv>=1.1.0",
+    "httpx>=0.28.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.25.0",
+    "ruff>=0.11.0",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+
+[tool.ruff.format]
+line-ending = "auto"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

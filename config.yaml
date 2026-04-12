@@ -1,0 +1,39 @@
+host: localhost
+port: 8000
+
+llm:
+  default: anthropic
+  providers:
+    - name: anthropic
+      provider: anthropic
+      # model: auto-discovered, or set preference e.g. "claude-sonnet"
+    - name: openai
+      provider: openai
+      # model: auto-discovered, or set preference e.g. "gpt-4o"
+  fallback:
+    - openai
+
+agent:
+  system_prompt: systemprompt/default.md
+  max_tool_rounds: 0  # 0 = unlimited
+
+memory:
+  db_path: ./data/memory.db
+  max_context_messages: 200
+  token_window: 100000
+
+channels:
+  telegram:
+    enabled: false
+    mode: polling
+  wechat:
+    enabled: false
+
+tools:
+  web_search: true
+  run_code: true
+  read_file: true
+
+sandbox:
+  timeout: 30
+  max_output: 10000
