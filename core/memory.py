@@ -107,7 +107,8 @@ class Memory:
     # --- Active messages ---
 
     async def add_message(self, chat_id: str, message: Message) -> None:
-        assert self._db is not None
+        if self._db is None:
+            raise RuntimeError("Memory not initialized — call init() first")
         tool_calls_json = (
             json.dumps([{"id": tc.id, "name": tc.name, "arguments": tc.arguments} for tc in message.tool_calls])
             if message.tool_calls
@@ -130,7 +131,8 @@ class Memory:
         await self._db.commit()
 
     async def get_history(self, chat_id: str) -> list[Message]:
-        assert self._db is not None
+        if self._db is None:
+            raise RuntimeError("Memory not initialized — call init() first")
         cursor = await self._db.execute(
             "SELECT role, content, tool_call_id, tool_calls, metadata"
             " FROM messages WHERE chat_id = ? ORDER BY id DESC LIMIT ?",
@@ -141,7 +143,8 @@ class Memory:
         return [self._row_to_message(row) for row in rows]
 
     async def get_token_count(self, chat_id: str) -> int:
-        assert self._db is not None
+        if self._db is None:
+            raise RuntimeError("Memory not initialized — call init() first")
         cursor = await self._db.execute("SELECT SUM(LENGTH(content)) FROM messages WHERE chat_id = ?", (chat_id,))
         row = await cursor.fetchone()
         return (row[0] if row and row[0] else 0) // CHARS_PER_TOKEN
@@ -150,13 +153,15 @@ class Memory:
         return token_count > self._token_window
 
     async def clear(self, chat_id: str) -> None:
-        assert self._db is not None
+        if self._db is None:
+            raise RuntimeError("Memory not initialized — call init() first")
         await self._db.execute("DELETE FROM messages WHERE chat_id = ?", (chat_id,))
         await self._db.commit()
         logger.info("Cleared active memory for chat_id=%s", chat_id)
 
     async def message_count(self, chat_id: str) -> int:
-        assert self._db is not None
+        if self._db is None:
+            raise RuntimeError("Memory not initialized — call init() first")
         cursor = await self._db.execute("SELECT COUNT(*) FROM messages WHERE chat_id = ?", (chat_id,))
         row = await cursor.fetchone()
         return row[0] if row else 0
@@ -165,7 +170,8 @@ class Memory:
 
     async def archive_messages(self, chat_id: str, messages: list[Message], topic: str, summary: str) -> None:
         """Archive compacted messages for future RAG retrieval."""
-        assert self._db is not None
+        if self._db is None:
+            raise RuntimeError("Memory not initialized — call init() first")
         full_json = json.dumps(
             [{"role": m.role, "content": m.content} for m in messages if m.content],
             ensure_ascii=False,
@@ -184,7 +190,14 @@ class Memory:
 
         Uses FTS5 for full-text search with BM25 ranking.
         """
-        assert self._db is not None
+        if self._db is None:
+            raise RuntimeError("Memory not initialized — call init() first")
+
+        # Sanitize FTS5 query: escape special chars to prevent query injection
+        # FTS5 operators: AND OR NOT NEAR * ^ "
+        sanitized = query.replace('"', '""')
+        sanitized = f'"{sanitized}"'  # phrase query — disables operator parsing
+
         try:
             if chat_id:
                 cursor = await self._db.execute(
@@ -195,7 +208,7 @@ class Memory:
                        WHERE archive_fts MATCH ? AND a.chat_id = ?
                        ORDER BY rank
                        LIMIT ?""",
-                    (query, chat_id, limit),
+                    (sanitized, chat_id, limit),
                 )
             else:
                 cursor = await self._db.execute(
@@ -206,7 +219,7 @@ class Memory:
                        WHERE archive_fts MATCH ?
                        ORDER BY rank
                        LIMIT ?""",
-                    (query, limit),
+                    (sanitized, limit),
                 )
             rows = await cursor.fetchall()
         except Exception:
@@ -246,7 +259,8 @@ class Memory:
 
     async def get_archive_entry(self, archive_id: int) -> dict[str, Any] | None:
         """Get a specific archive entry by ID (for agent to read full context)."""
-        assert self._db is not None
+        if self._db is None:
+            raise RuntimeError("Memory not initialized — call init() first")
         cursor = await self._db.execute(
             "SELECT id, chat_id, topic, summary, full_messages, created_at FROM archive WHERE id = ?",
             (archive_id,),
@@ -265,7 +279,8 @@ class Memory:
 
     async def list_archive(self, chat_id: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
         """List archived conversation summaries (progressive disclosure — summaries only)."""
-        assert self._db is not None
+        if self._db is None:
+            raise RuntimeError("Memory not initialized — call init() first")
         if chat_id:
             cursor = await self._db.execute(
                 "SELECT id, topic, summary, token_count, created_at FROM archive"

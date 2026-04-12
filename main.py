@@ -190,9 +190,8 @@ class Memoo:
             token_window=mem_config.get("token_window", 100_000),
         )
 
-        self.scheduler = Scheduler(
-            db_path=mem_config.get("db_path", "./data/schedules.db").replace("memory", "schedules")
-        )
+        db_dir = str(Path(mem_config.get("db_path", "./data/memory.db")).parent)
+        self.scheduler = Scheduler(db_path=str(Path(db_dir) / "schedules.db"))
 
         self.heartbeat = Heartbeat(heartbeat_dir="./heartbeat")
         self.tools = ToolRegistry()
@@ -284,8 +283,14 @@ class Memoo:
             return kwargs
 
     async def handle_message(self, chat_id: str, text: str, metadata: dict[str, Any]) -> str:
-        assert self.agent is not None
-        assert self.llm is not None
+        if self.agent is None or self.llm is None:
+            return "Error: Memoo not initialized"
+
+        # Truncate excessively long messages
+        MAX_MSG_LEN = 50_000
+        if len(text) > MAX_MSG_LEN:
+            text = text[:MAX_MSG_LEN] + "\n...(truncated)"
+            logger.warning("Message from chat_id=%s truncated: %d -> %d chars", chat_id, len(text), MAX_MSG_LEN)
 
         if metadata.get("command") == "clear":
             await self.memory.clear(chat_id)
@@ -294,7 +299,7 @@ class Memoo:
         active = self._active_tasks.get(chat_id)
         if active and not active.done():
             logger.info("Interrupting active agent for chat_id=%s", chat_id)
-            self.agent.cancel()
+            self.agent.cancel(chat_id)
             active.cancel()
             try:
                 await active
@@ -351,7 +356,8 @@ class Memoo:
         return await self.handle_message(heartbeat_chat, prompt, {"source": "heartbeat", **context})
 
     async def _compact_memory(self, chat_id: str) -> None:
-        assert self.llm is not None
+        if self.llm is None:
+            return
         history = await self.memory.get_history(chat_id)
         if len(history) < 6:
             return

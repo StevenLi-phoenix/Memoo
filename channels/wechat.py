@@ -51,7 +51,8 @@ class WeChatChannel:
 
     async def send(self, chat_id: str, text: str, context_token: str = "") -> None:
         """Send a text message. context_token must echo from the inbound message."""
-        assert self._client is not None
+        if self._client is None:
+            return
 
         payload: dict[str, Any] = {
             "to_user": chat_id,
@@ -69,7 +70,8 @@ class WeChatChannel:
 
     async def send_typing(self, chat_id: str) -> None:
         """Send a typing indicator."""
-        assert self._client is not None
+        if self._client is None:
+            return
         try:
             await self._client.post("/sendtyping", json={"to_user": chat_id})
         except httpx.HTTPError:
@@ -114,7 +116,8 @@ class WeChatChannel:
 
     async def _get_updates(self) -> list[dict[str, Any]]:
         """Fetch new messages via long-polling."""
-        assert self._client is not None
+        if self._client is None:
+            return
         payload: dict[str, Any] = {"timeout": POLL_TIMEOUT}
         if self._cursor:
             payload["get_updates_buf"] = self._cursor

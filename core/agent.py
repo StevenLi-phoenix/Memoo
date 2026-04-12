@@ -18,6 +18,9 @@ from models import LLMProvider, LLMResponse, Message
 
 logger = logging.getLogger(__name__)
 
+# Safety cap even when max_rounds=0 (unlimited), prevents API budget exhaustion
+HARD_MAX_ROUNDS = 200
+
 COMPRESS_DECISION_PROMPT = """\
 Based on the conversation below, answer in JSON:
 {{"topic_changed": true/false, "current_topic": "brief topic",
@@ -71,13 +74,23 @@ class Agent:
         self._max_rounds = max_rounds  # 0 = unlimited
         self._fallback_llms = fallback_llms or []
         self._hooks = hooks or HookRegistry()
-        self._cancel_event: asyncio.Event | None = None
+        self._cancel_events: dict[str, asyncio.Event] = {}
 
-    def cancel(self) -> None:
-        """Cancel the current agent run (message interruption)."""
-        if self._cancel_event:
-            self._cancel_event.set()
-            logger.info("Agent run cancelled")
+    def cancel(self, run_id: str | None = None) -> None:
+        """Cancel an agent run by *run_id* (e.g. chat_id).
+
+        If *run_id* is ``None``, cancel **all** active runs.
+        """
+        if run_id is not None:
+            ev = self._cancel_events.get(run_id)
+            if ev:
+                ev.set()
+                logger.info("Agent run cancelled (run_id=%s)", run_id)
+        else:
+            for rid, ev in self._cancel_events.items():
+                ev.set()
+            if self._cancel_events:
+                logger.info("All agent runs cancelled (%d)", len(self._cancel_events))
 
     async def run(
         self,
@@ -89,8 +102,24 @@ class Agent:
 
         Returns TurnResult with response text and compression decision.
         """
-        self._cancel_event = asyncio.Event()
         ctx = context or {}
+        run_id = str(ctx.get("chat_id", id(asyncio.current_task())))
+        cancel_event = asyncio.Event()
+        self._cancel_events[run_id] = cancel_event
+
+        try:
+            return await self._run_loop(user_message, ctx, cancel_event, history)
+        finally:
+            self._cancel_events.pop(run_id, None)
+
+    async def _run_loop(
+        self,
+        user_message: str,
+        ctx: dict[str, Any],
+        cancel_event: asyncio.Event,
+        history: list[Message] | None,
+    ) -> TurnResult:
+        """Inner agent loop, isolated with its own *cancel_event*."""
         messages = list(history) if history else []
         messages.append(Message(role="user", content=user_message))
 
@@ -101,9 +130,10 @@ class Agent:
 
         while True:
             round_num += 1
-            if self._max_rounds > 0 and round_num > self._max_rounds:
+            effective_max = self._max_rounds if self._max_rounds > 0 else HARD_MAX_ROUNDS
+            if round_num > effective_max:
                 break
-            if self._cancel_event.is_set():
+            if cancel_event.is_set():
                 return TurnResult(response="(cancelled by user)", usage=total_usage)
 
             logger.info("Agent round %d", round_num)
@@ -136,7 +166,7 @@ class Agent:
 
             # Execute tool calls with authorization hooks
             for tc in response.tool_calls:
-                if self._cancel_event.is_set():
+                if cancel_event.is_set():
                     return TurnResult(response="(cancelled during tool execution)", usage=total_usage)
 
                 # Authorization check

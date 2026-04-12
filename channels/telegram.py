@@ -42,7 +42,8 @@ class TelegramChannel:
             raise NotImplementedError(f"Telegram mode '{self._mode}' not implemented yet")
 
     async def send(self, chat_id: str, text: str) -> None:
-        assert self._app is not None
+        if self._app is None:
+            return
         # Telegram has a 4096 char limit per message
         for i in range(0, len(text), 4000):
             chunk = text[i : i + 4000]
@@ -84,7 +85,8 @@ class TelegramChannel:
         logger.info("Telegram message from chat_id=%s: %s", chat_id, user_text[:100])
 
         try:
-            assert self._handler is not None
+            if self._handler is None:
+                return
             response = await self._handler(chat_id, user_text, metadata)
             await self.send(chat_id, response)
         except Exception:

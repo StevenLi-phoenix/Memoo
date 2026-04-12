@@ -66,12 +66,14 @@ class TUIChannel:
                 break
 
             if text == "/clear":
-                assert self._handler is not None
+                if self._handler is None:
+                    return
                 await self._handler(self._chat_id, text, {"command": "clear"})
                 print("Memory cleared.")
                 continue
 
-            assert self._handler is not None
+            if self._handler is None:
+                return
             try:
                 response = await self._handler(self._chat_id, text, {"platform": "tui"})
                 await self.send(self._chat_id, response)

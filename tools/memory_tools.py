@@ -6,7 +6,7 @@ import json
 import logging
 from typing import Any
 
-from core.tools import ToolRegistry
+from core.tools import ToolRegistry, get_context
 
 logger = logging.getLogger(__name__)
 
@@ -26,8 +26,9 @@ def register(registry: ToolRegistry, **deps: Any) -> None:
             query: Search keywords to find relevant past conversations.
             limit: Maximum number of results to return.
         """
-        logger.info("search_memory: query=%s, limit=%d", query, limit)
-        results = await memory.search_archive(query, limit=limit)
+        chat_id = get_context().get("chat_id", "")
+        logger.info("search_memory: query=%s, limit=%d, chat_id=%s", query, limit, chat_id)
+        results = await memory.search_archive(query, chat_id=chat_id, limit=limit)
 
         if not results:
             return "No matching memories found."
@@ -48,13 +49,19 @@ def register(registry: ToolRegistry, **deps: Any) -> None:
         Args:
             memory_id: The ID of the archived memory to read (from search_memory results).
         """
-        logger.info("read_memory: id=%d", memory_id)
+        if memory_id < 0:
+            return "Error: invalid memory_id"
+        chat_id = get_context().get("chat_id", "")
+        logger.info("read_memory: id=%d, chat_id=%s", memory_id, chat_id)
         entry = await memory.get_archive_entry(memory_id)
 
-        if not entry:
+        if not entry or entry.get("chat_id") != chat_id:
             return f"Memory #{memory_id} not found."
 
-        messages = json.loads(entry["full_messages"])
+        try:
+            messages = json.loads(entry["full_messages"])
+        except (json.JSONDecodeError, TypeError):
+            return f"Memory #{memory_id} data corrupted."
         lines: list[str] = [
             f"**Memory #{entry['id']}** — Topic: {entry['topic']}",
             f"Date: {entry['created_at']}",
@@ -77,8 +84,9 @@ def register(registry: ToolRegistry, **deps: Any) -> None:
         Args:
             limit: Maximum number of entries to list.
         """
-        logger.info("list_memories: limit=%d", limit)
-        entries = await memory.list_archive(limit=limit)
+        chat_id = get_context().get("chat_id", "")
+        logger.info("list_memories: limit=%d, chat_id=%s", limit, chat_id)
+        entries = await memory.list_archive(chat_id=chat_id, limit=limit)
 
         if not entries:
             return "No archived memories."

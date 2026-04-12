@@ -33,16 +33,22 @@ CREATE TABLE IF NOT EXISTS schedules (
 
 
 def _match_cron_field(field: str, value: int) -> bool:
-    if field == "*":
-        return True
-    if field.startswith("*/"):
-        return value % int(field[2:]) == 0
-    if "-" in field and "," not in field:
-        low, high = field.split("-", 1)
-        return int(low) <= value <= int(high)
-    if "," in field:
-        return value in {int(v) for v in field.split(",")}
-    return value == int(field)
+    try:
+        if field == "*":
+            return True
+        if field.startswith("*/"):
+            step = int(field[2:])
+            if step <= 0:
+                return False
+            return value % step == 0
+        if "-" in field and "," not in field:
+            low, high = field.split("-", 1)
+            return int(low) <= value <= int(high)
+        if "," in field:
+            return value in {int(v) for v in field.split(",")}
+        return value == int(field)
+    except (ValueError, ZeroDivisionError):
+        return False
 
 
 def cron_matches(cron_expr: str, dt: datetime) -> bool:
@@ -105,7 +111,8 @@ class Scheduler:
     # --- CRUD (called by agent tools) ---
 
     async def create_schedule(self, name: str, cron: str, chat_id: str, channel: str, prompt: str) -> str:
-        assert self._db is not None
+        if self._db is None:
+            raise RuntimeError("Scheduler not initialized — call init() first")
         parts = cron.strip().split()
         if len(parts) != CRON_FIELDS:
             return f"Error: invalid cron '{cron}'. Need 5 fields: minute hour day month weekday"
@@ -124,7 +131,8 @@ class Scheduler:
             return f"Error: schedule '{name}' already exists."
 
     async def delete_schedule(self, name: str) -> str:
-        assert self._db is not None
+        if self._db is None:
+            raise RuntimeError("Scheduler not initialized — call init() first")
         cursor = await self._db.execute("DELETE FROM schedules WHERE name = ?", (name,))
         await self._db.commit()
         if cursor.rowcount > 0:
@@ -133,7 +141,8 @@ class Scheduler:
         return f"Schedule '{name}' not found."
 
     async def list_schedules(self) -> str:
-        assert self._db is not None
+        if self._db is None:
+            raise RuntimeError("Scheduler not initialized — call init() first")
         cursor = await self._db.execute(
             "SELECT name, cron, chat_id, channel, prompt, enabled FROM schedules ORDER BY name"
         )
@@ -151,7 +160,8 @@ class Scheduler:
         return "\n".join(lines)
 
     async def toggle_schedule(self, name: str, enabled: bool) -> str:
-        assert self._db is not None
+        if self._db is None:
+            raise RuntimeError("Scheduler not initialized — call init() first")
         cursor = await self._db.execute("UPDATE schedules SET enabled = ? WHERE name = ?", (1 if enabled else 0, name))
         await self._db.commit()
         if cursor.rowcount > 0:
@@ -179,7 +189,8 @@ class Scheduler:
 
     async def _get_next_fire(self) -> tuple[float, list[dict[str, Any]]]:
         """Calculate seconds until next fire and which tasks fire then."""
-        assert self._db is not None
+        if self._db is None:
+            raise RuntimeError("Scheduler not initialized — call init() first")
         cursor = await self._db.execute("SELECT name, cron, chat_id, channel, prompt FROM schedules WHERE enabled = 1")
         rows = await cursor.fetchall()
 

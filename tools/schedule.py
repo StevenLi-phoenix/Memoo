@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from core.tools import ToolRegistry
+from core.tools import ToolRegistry, get_context
 
 logger = logging.getLogger(__name__)
 
@@ -19,7 +19,7 @@ def register(registry: ToolRegistry, **deps: Any) -> None:
     default_channel = deps.get("default_channel", "telegram")
 
     @registry.tool
-    async def create_schedule(name: str, cron: str, prompt: str, chat_id: str = "", channel: str = "") -> str:
+    async def create_schedule(name: str, cron: str, prompt: str, channel: str = "") -> str:
         """Create a recurring scheduled task with a cron expression.
 
         Args:
@@ -27,9 +27,9 @@ def register(registry: ToolRegistry, **deps: Any) -> None:
             cron: Cron expression with 5 fields: minute hour day month weekday.
                 Examples: '0 8 * * *' (daily 8am), '*/30 * * * *' (every 30min).
             prompt: The message/prompt to execute when the schedule fires.
-            chat_id: Target chat ID to send results to. Defaults to current chat.
             channel: Channel to use (telegram, wechat). Defaults to configured default.
         """
+        chat_id = get_context().get("chat_id", "")
         ch = channel or default_channel
         return await scheduler.create_schedule(name, cron, chat_id, ch, prompt)
 

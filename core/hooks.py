@@ -72,20 +72,21 @@ class HookRegistry:
 # --- Built-in hooks ---
 
 
+# Module-level state for rate limiter (persists across requests)
+_rate_limit_state: dict[str, list[float]] = {}
+
+
 async def rate_limit_hook(tool_name: str, arguments: dict[str, Any], context: dict[str, Any]) -> tuple[bool, str]:
     """Simple rate limiting hook. Tracks calls per chat per minute."""
-    # This is a basic implementation — in production, use a proper rate limiter
     import time
 
-    state: dict[str, list[float]] = context.setdefault("_rate_limit", {})
     key = f"{context.get('chat_id', '')}:{tool_name}"
     now = time.time()
 
-    calls = state.setdefault(key, [])
-    # Remove calls older than 60 seconds
+    calls = _rate_limit_state.setdefault(key, [])
     calls[:] = [t for t in calls if now - t < 60]
 
-    max_per_minute = context.get("rate_limit", 30)
+    max_per_minute = 30
     if len(calls) >= max_per_minute:
         return False, f"Rate limit exceeded: {tool_name} ({max_per_minute}/min)"
 
@@ -94,7 +95,7 @@ async def rate_limit_hook(tool_name: str, arguments: dict[str, Any], context: di
 
 
 async def sandbox_path_hook(tool_name: str, arguments: dict[str, Any], context: dict[str, Any]) -> tuple[bool, str]:
-    """Deny file tools that attempt to access paths outside sandbox."""
+    """Deny file tools that access paths outside the session's sandbox."""
     import os
 
     if tool_name not in ("read_file", "write_file"):
@@ -102,7 +103,11 @@ async def sandbox_path_hook(tool_name: str, arguments: dict[str, Any], context: 
 
     path = arguments.get("path", "")
     sandbox_dir = context.get("sandbox_dir", "./sandbox")
-    abs_sandbox = os.path.realpath(sandbox_dir)
+    chat_id = context.get("chat_id", "")
+    # Check against the per-session sandbox directory
+    safe_id = "".join(c if c.isalnum() or c in "-_" else "_" for c in str(chat_id)) if chat_id else ""
+    session_dir = os.path.join(sandbox_dir, safe_id) if safe_id else sandbox_dir
+    abs_sandbox = os.path.realpath(session_dir)
     abs_path = os.path.realpath(os.path.join(abs_sandbox, path))
 
     if not abs_path.startswith(abs_sandbox + os.sep) and abs_path != abs_sandbox:
