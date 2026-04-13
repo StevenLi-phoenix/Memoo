@@ -2,7 +2,7 @@
 
 Lightweight personal AI agent bot built on Claude API `tool_use` with OpenAI fallback. A single `Agent` class orchestrates perception–decision–action–reflection cycles, and all messaging platforms flow through one central `handle_message()` entry point.
 
-**macOS only** — code execution sandboxing requires `sandbox-exec`.
+**macOS and Linux** — code execution sandboxing uses `sandbox-exec` on macOS (built-in) or `bubblewrap` on Linux (`apt install bubblewrap` / `dnf install bubblewrap`). Windows is not supported.
 
 ## Features
 
@@ -12,7 +12,7 @@ Lightweight personal AI agent bot built on Claude API `tool_use` with OpenAI fal
 - **Dream cycle** — Periodic memory consolidation via LLM, with Anthropic Batch API support (50% cost)
 - **Skills system** — Three-level progressive disclosure (metadata → instructions → resources), auto-discovered from `skills/` directory
 - **Sub-agent spawning** — Depth-limited child agents with per-provider model selection, context modes, and sandbox flags
-- **Per-session sandbox** — OS-level isolation via macOS `sandbox-exec` with custom SBPL profiles
+- **Per-session sandbox** — OS-level isolation: macOS `sandbox-exec` with custom SBPL profiles, or Linux `bubblewrap` with namespace isolation. Auto-detected at startup.
 - **Slash commands** — `/help`, `/clear`, `/config`, `/model`, `/status`, `/new`, `/compact`, and skill triggers
 - **Cron scheduler** — 5-field cron expressions with SQLite persistence
 - **Heartbeat tasks** — Periodic tasks defined as markdown files with YAML frontmatter
@@ -90,7 +90,7 @@ main.py            ─── orchestrates everything
 │   ├── gateway.py     JSON-over-TCP streaming server
 │   ├── config.py      AppConfig dataclass
 │   ├── skills.py      Progressive skill disclosure
-│   ├── sandbox.py     macOS sandbox-exec isolation
+│   ├── sandbox.py     macOS sandbox-exec / Linux bubblewrap (auto-detected)
 │   └── crash.py       Crash reports + autofix
 ├── channels/          Telegram, WeChat, TUI
 ├── tools/             Auto-discovered tool modules

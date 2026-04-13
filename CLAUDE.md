@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Memoo is a lightweight personal AI agent bot built directly on the Claude API `tool_use` capability (with OpenAI fallback). A single `Agent` class orchestrates perception-decision-action-reflection cycles, and all messaging platforms flow through one central `handle_message()` entry point.
 
-**macOS only** — code execution sandboxing requires `sandbox-exec` (built into macOS).
+**macOS and Linux** — code execution sandboxing uses `sandbox-exec` (macOS, built-in) or `bubblewrap` / `bwrap` (Linux, install via `apt install bubblewrap` or `dnf install bubblewrap`). Backend is auto-detected at startup via `platform.system()`; Windows is not supported.
 
 ## Commands
 
@@ -72,7 +72,7 @@ main.py (Memoo)  ─── orchestrates everything
 - **Context window enforcement**: Two-phase compression in `Agent._enforce_context_window()` — Phase 1 replaces old messages with archived memory summaries, Phase 2 strips middle and summarizes with the compressor LLM (cheapest fallback).
 - **Prompt caching** (Anthropic): System prompt and last tool schema get `cache_control: ephemeral`
 - **Telegram bind-code auth**: Fail-close allowlist — on startup a one-time bind code (`secrets.token_hex(4)`) is printed; user sends `/bind <code>` in Telegram to self-register. Code rotates after each bind. Bound user IDs persist to `config.yaml` via `on_bind` callback.
-- **Per-session sandbox**: `sandbox/{chat_id}/` directories enforced at OS level by macOS `sandbox-exec` with a custom SBPL profile
+- **Per-session sandbox**: `sandbox/{chat_id}/` directories enforced at OS level. On macOS via `sandbox-exec` with a dynamically generated SBPL profile (`(deny default)` baseline); on Linux via `bubblewrap` with namespace isolation (`--unshare-user/pid/ipc/uts/cgroup`, optional `--unshare-net`, workspace bind-mounted at `/workspace`). The `Sandbox` class in `core/sandbox.py` wraps both backends behind a unified API with a smoke test on startup.
 - **Sub-agent spawning**: `tools/subagent.py` provides `spawn_agent`, `read_agent_output`, `cancel_agent`, `list_agents`. Supports depth limiting, per-provider model selection, context modes (full/summary/none), readonly/no-network sandbox flags, and background mode with run_id.
 - **Dream cycle**: `core/dream.py` runs two-phase LLM consolidation of archived conversations into `memory/MEMORY.md` and `memory/USER.md`. Cursor-based incremental processing ensures each archive entry is analyzed once. When Anthropic provider is detected, both phases are submitted as Batch API requests (50% cost discount) with prompt caching; polls every 10s with 30-min timeout. Falls back to sequential `chat()` when batches are unavailable. Dream output is injected into the system prompt.
 - **Skills progressive disclosure**: L1 metadata (name+description) always in system prompt (~100 tokens each). L2 instructions loaded on-demand via `load_skill()` tool. L3 resources loaded via `load_skill_resource()`.
