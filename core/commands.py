@@ -157,7 +157,7 @@ def _cmd_model(arg: str, deps: dict[str, Any]) -> str:
         for p in config.llm.providers:
             cached = cache.get(p.provider)
             if cached:
-                model_ids = [m.id for m in sorted(cached, key=lambda x: x.created, reverse=True)[:8]]
+                model_ids = [m.id for m in sorted(cached, key=lambda x: x.created or 0, reverse=True)[:8]]
                 lines.append(f"**{p.name}** ({p.provider}):")
                 for mid in model_ids:
                     marker = " ← current" if mid == model_name else ""

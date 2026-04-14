@@ -22,6 +22,7 @@ class ProviderConfig:
     provider: str = ""
     model: str = ""
     advisor: str = ""
+    base_url: str = ""
 
 
 @dataclass
@@ -31,6 +32,33 @@ class LLMConfig:
     fallback: list[str] = field(default_factory=list)
     compressor: str = ""  # model name/preference for context compression (e.g. "haiku", "gpt-5.4-mini")
     model_cache_ttl: int = 86400  # seconds (24h)
+
+    def resolve_provider(self, ref: str) -> ProviderConfig | None:
+        """Find a provider by exact name, then `provider/...` prefix, then bare provider type."""
+        if not ref or not self.providers:
+            return None
+        for p in self.providers:
+            if p.name == ref:
+                return p
+        prefix = ref + "/"
+        for p in self.providers:
+            if p.name.startswith(prefix):
+                return p
+        for p in self.providers:
+            if p.provider == ref:
+                return p
+        return None
+
+    def default_provider(self) -> ProviderConfig | None:
+        return self.resolve_provider(self.default)
+
+
+def split_model_ref(ref: str) -> tuple[str, str]:
+    """Parse 'provider/model' into (provider_hint, model_pref). Bare strings → ('', ref)."""
+    if "/" in ref:
+        prov, _, model = ref.partition("/")
+        return prov, model
+    return "", ref
 
 
 @dataclass
@@ -68,6 +96,14 @@ class ToolsConfig:
 class SandboxConfig:
     timeout: int = 300  # seconds — per-execution timeout
     max_output: int = 10_000  # chars
+    # Credential/config plumbing for CLI tools run inside the sandbox.
+    # `env` — literal key/value pairs (paths, flags). Values are expanduser'd.
+    # `env_from_cmd` — key -> shell command. Command runs in parent (unsandboxed),
+    #                  stdout becomes the value. Cached for process lifetime.
+    # `env_passthrough` — copy named env vars from the parent if set.
+    env: dict[str, str] = field(default_factory=dict)
+    env_from_cmd: dict[str, str] = field(default_factory=dict)
+    env_passthrough: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -164,6 +200,7 @@ class AppConfig:
                 provider=p.get("provider", ""),
                 model=p.get("model", ""),
                 advisor=p.get("advisor", ""),
+                base_url=p.get("base_url", ""),
             )
             for p in llm_raw.get("providers", [])
         ]
@@ -202,6 +239,9 @@ class AppConfig:
         sb_raw = raw.get("sandbox", {})
         cfg.sandbox.timeout = sb_raw.get("timeout", cfg.sandbox.timeout)
         cfg.sandbox.max_output = sb_raw.get("max_output", cfg.sandbox.max_output)
+        cfg.sandbox.env = dict(sb_raw.get("env", {}) or {})
+        cfg.sandbox.env_from_cmd = dict(sb_raw.get("env_from_cmd", {}) or {})
+        cfg.sandbox.env_passthrough = list(sb_raw.get("env_passthrough", []) or [])
 
         # Embedding
         emb_raw = raw.get("embedding", {})
@@ -267,7 +307,13 @@ class AppConfig:
             "llm": {
                 "default": self.llm.default,
                 "providers": [
-                    {"name": p.name, "provider": p.provider, "model": p.model, "advisor": p.advisor}
+                    {
+                        "name": p.name,
+                        "provider": p.provider,
+                        "model": p.model,
+                        "advisor": p.advisor,
+                        "base_url": p.base_url,
+                    }
                     for p in self.llm.providers
                 ],
                 "fallback": self.llm.fallback,
@@ -299,6 +345,9 @@ class AppConfig:
             "sandbox": {
                 "timeout": self.sandbox.timeout,
                 "max_output": self.sandbox.max_output,
+                "env": self.sandbox.env,
+                "env_from_cmd": self.sandbox.env_from_cmd,
+                "env_passthrough": self.sandbox.env_passthrough,
             },
             "embedding": {
                 "provider": self.embedding.provider,

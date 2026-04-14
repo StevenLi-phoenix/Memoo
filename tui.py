@@ -251,28 +251,48 @@ def _render_inline(line: str) -> str:
 # ─── Tool Display ──────────────────────────────────────────────────
 
 
+def _format_tool_args(name: str, args: str) -> str:
+    """Extract the user-relevant bit of the args preview for display.
+
+    agent.py emits args like `code='curl -s ifconfig.me', language='bash'`.
+    For run_code we surface just the code (the thing the user wants to audit);
+    for other tools we pass through the whole preview truncated to width.
+    """
+    if not args:
+        return ""
+    if name == "run_code":
+        m = re.search(r"code=(['\"])(.*?)\1", args)
+        if m:
+            code = m.group(2)
+            return f"$ {code}" if len(code) <= 200 else f"$ {code[:200]}…"
+    return args[:200]
+
+
 class ToolTracker:
     """Track active tool calls with elapsed time and animated spinner."""
 
     def __init__(self) -> None:
-        self._active: dict[str, float] = {}  # name -> start_time
+        self._active: dict[str, tuple[float, str]] = {}  # name -> (start_time, args)
         self._count = 0
         self._spinner_idx = 0
 
     def start(self, name: str, args: str) -> None:
-        self._active[name] = time.monotonic()
+        self._active[name] = (time.monotonic(), args)
         self._count += 1
         self._render_active()
 
     def done(self, name: str, ok: bool, result: str) -> None:
-        elapsed = time.monotonic() - self._active.pop(name, time.monotonic())
+        start_time, args = self._active.pop(name, (time.monotonic(), ""))
+        elapsed = time.monotonic() - start_time
         status = f"{GREEN}✓{RESET}" if ok else f"{RED}✗{RESET}"
         elapsed_str = f" {DIM}({elapsed:.1f}s){RESET}" if elapsed >= 0.1 else ""
-        # Use terminal width for preview length (leave room for prefix)
-        max_preview = max(_tw() - len(name) - 20, 40)
+        args_str = f" {CYAN}{_format_tool_args(name, args)}{RESET}" if args else ""
+        # Use terminal width for result preview length
+        reserved = len(name) + len(args) + 20
+        max_preview = max(_tw() - reserved, 40)
         preview = result.replace("\n", " ")[:max_preview]
         result_str = f" {DIM}→ {preview}{RESET}" if preview else ""
-        sys.stdout.write(f"{ERASE_LINE}\r  {status} {GREY}{name}{RESET}{elapsed_str}{result_str}\n")
+        sys.stdout.write(f"{ERASE_LINE}\r  {status} {GREY}{name}{RESET}{elapsed_str}{args_str}{result_str}\n")
         sys.stdout.flush()
 
     def tick(self) -> None:
@@ -282,7 +302,8 @@ class ToolTracker:
 
     def _render_active(self) -> None:
         name = next(iter(self._active))
-        elapsed = time.monotonic() - self._active[name]
+        start_time, _ = self._active[name]
+        elapsed = time.monotonic() - start_time
         frame = SPINNER_FRAMES[self._spinner_idx % len(SPINNER_FRAMES)]
         self._spinner_idx += 1
         elapsed_str = f" {DIM}{elapsed:.0f}s{RESET}" if elapsed >= 1.0 else ""
@@ -533,6 +554,8 @@ async def _read_events(event_queue: asyncio.Queue[dict | None], timeout: int = 6
                 reply = event.get("reply", "")
                 if reply.strip():
                     print(f"\n{CYAN}{BOLD}Memoo:{RESET} {render_markdown(reply)}\n")
+                else:
+                    print(f"\n{CYAN}{BOLD}Memoo:{RESET} {DIM}(empty reply){RESET}\n")
                 # Footer: tool count + token usage
                 footer_parts: list[str] = []
                 if tracker.total:

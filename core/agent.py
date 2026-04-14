@@ -28,7 +28,12 @@ RESPONSE_SCHEMA: dict[str, Any] = {
     "properties": {
         "reply": {
             "type": "string",
-            "description": "Reply to the user. Empty string if nothing to say (NO_OP).",
+            "description": (
+                "Your reply text to the user. Must be a substantive, non-empty response "
+                "for any direct user message. Only use an empty string when the message "
+                "carries the marker '[System: this message is from ...]' AND there is "
+                "genuinely nothing actionable to report."
+            ),
         },
         "memory_notes": {
             "type": "array",
@@ -296,7 +301,7 @@ class Agent:
 
         chat_id = ctx.get("chat_id", "")
         if self._gateway and chat_id:
-            args_preview = ", ".join(f"{k}={repr(v)[:50]}" for k, v in tc.arguments.items())
+            args_preview = ", ".join(f"{k}={repr(v)[:300]}" for k, v in tc.arguments.items())
             await self._gateway.send_event(chat_id, {"event": "tool_start", "name": tc.name, "args": args_preview})
 
         result = await self._tools.execute(tc.name, tc.arguments)

@@ -153,6 +153,17 @@ class ToolRegistry:
         func = self._tools[name]
         logger.info("Tool call: %s(%s)", name, _summarize_args(arguments))
 
+        schema = self._schemas.get(name, {}).get("input_schema", {})
+        required = schema.get("required", [])
+        missing = [r for r in required if r not in arguments or arguments[r] in (None, "")]
+        if missing:
+            error = (
+                f"Tool {name}: missing required argument(s): {', '.join(missing)}. "
+                f"Expected schema: {json.dumps(schema)}"
+            )
+            logger.error("Tool FAIL: %s -> %s", name, error)
+            return json.dumps({"error": error})
+
         try:
             if inspect.iscoroutinefunction(func):
                 result = await func(**arguments)
@@ -163,6 +174,10 @@ class ToolRegistry:
             preview = output.replace("\n", " ")[:120]
             logger.info("Tool OK: %s -> %s", name, preview)
             return output
+        except TypeError as e:
+            error = f"Tool {name}: bad arguments ({e}). Expected schema: {json.dumps(schema)}"
+            logger.error("Tool FAIL: %s -> %s", name, error)
+            return json.dumps({"error": error})
         except Exception as e:
             error = f"Tool {name} failed: {e}"
             logger.error("Tool FAIL: %s -> %s", name, e)

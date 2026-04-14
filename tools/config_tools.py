@@ -94,18 +94,25 @@ def register(registry: ToolRegistry, **deps: Any) -> None:
 
 
 def _resolve_model(preference: str, providers: list[Any]) -> tuple[str | None, Any | None]:
-    """Fuzzy-resolve a model name across all providers. Returns (model_id, provider_config)."""
+    """Fuzzy-resolve a model name across all providers. Returns (model_id, provider_config).
+
+    Accepts bare names ("haiku") or slash-qualified refs ("anthropic/claude-haiku-4-5").
+    """
+    from core.config import split_model_ref
     from models import ModelCache
 
+    prov_hint, model_pref = split_model_ref(preference)
     cache = ModelCache()
     for p in providers:
+        if prov_hint and p.provider != prov_hint:
+            continue
         cached = cache.get(p.provider)
         if not cached:
             continue
-        exact = [m for m in cached if m.id == preference]
-        matches = exact or [m for m in cached if preference in m.id]
+        exact = [m for m in cached if m.id == model_pref]
+        matches = exact or [m for m in cached if model_pref in m.id]
         if matches:
-            resolved = exact[0].id if exact else sorted(matches, key=lambda x: x.created, reverse=True)[0].id
+            resolved = exact[0].id if exact else sorted(matches, key=lambda x: x.created or 0, reverse=True)[0].id
             return resolved, p
     return None, None
 
@@ -119,7 +126,7 @@ def _list_available_models(providers: list[Any]) -> str:
     for p in providers:
         cached = cache.get(p.provider)
         if cached:
-            all_models.extend(m.id for m in sorted(cached, key=lambda x: x.created, reverse=True)[:5])
+            all_models.extend(m.id for m in sorted(cached, key=lambda x: x.created or 0, reverse=True)[:5])
     return ", ".join(all_models)
 
 
@@ -130,7 +137,7 @@ def _update_model(value: str, config: Any, app: Any) -> str:
         return f"Model '{value}' not found. Available: {_list_available_models(config.llm.providers)}"
 
     # Find the default provider's config entry
-    default_p = next((p for p in config.llm.providers if p.name == config.llm.default), None)
+    default_p = config.llm.default_provider()
     if not default_p:
         return "No default provider configured."
 
@@ -145,8 +152,9 @@ def _update_model(value: str, config: Any, app: Any) -> str:
     config.save()
 
     # Hot-reload the live provider
+    current_default = config.llm.default_provider()
     if app and hasattr(app, "llm") and app.llm:
-        if p_conf.name == config.llm.default and hasattr(app.llm, "model_name"):
+        if current_default and p_conf.name == current_default.name and hasattr(app.llm, "model_name"):
             app.llm.model_name = resolved  # type: ignore[union-attr]
             logger.info("Hot-reloaded model: %s -> %s", old, resolved)
             return f"Model: {old} -> {resolved} (live)"
@@ -230,7 +238,7 @@ def _model_options_help(key: str, config: Any) -> str:
     cache = ModelCache()
     current = ""
     if key == "llm.model":
-        default_p = next((p for p in config.llm.providers if p.name == config.llm.default), None)
+        default_p = config.llm.default_provider()
         current = default_p.model if default_p else ""
     elif key == "llm.compressor":
         current = config.llm.compressor or "(default: last fallback provider)"
@@ -241,7 +249,7 @@ def _model_options_help(key: str, config: Any) -> str:
         cached = cache.get(p.provider)
         if not cached:
             continue
-        models = sorted(cached, key=lambda x: x.created, reverse=True)[:8]
+        models = sorted(cached, key=lambda x: x.created or 0, reverse=True)[:8]
         lines.append(f"  {p.name} ({p.provider}):")
         for m in models:
             marker = " ← current" if m.id == current else ""

@@ -30,14 +30,27 @@ class Sandbox:
     Each session gets an isolated directory under base_dir.
     """
 
-    def __init__(self, base_dir: str = "./sandbox", timeout: int = 300, max_output: int = 10_000) -> None:
+    def __init__(
+        self,
+        base_dir: str = "./sandbox",
+        timeout: int = 300,
+        max_output: int = 10_000,
+        env: dict[str, str] | None = None,
+        env_from_cmd: dict[str, str] | None = None,
+        env_passthrough: list[str] | None = None,
+    ) -> None:
         self._base_dir = os.path.realpath(base_dir)
         self._timeout = timeout
         self._max_output = max_output
         self._backend = ""
+        self._extra_env_literal = dict(env or {})
+        self._extra_env_cmd = dict(env_from_cmd or {})
+        self._extra_env_passthrough = list(env_passthrough or [])
+        self._extra_env_cache: dict[str, str] = {}
 
         os.makedirs(self._base_dir, exist_ok=True)
         self._detect_backend()
+        self._resolve_extra_env()
 
     @property
     def backend(self) -> str:
@@ -103,7 +116,7 @@ class Sandbox:
         cmd = self._build_cmd(exec_dir, inner_cmd, readonly=readonly, no_network=no_network)
 
         # bwrap sets its own env/cwd via flags; darwin needs them via subprocess
-        env = _safe_env(exec_dir) if self._backend == "darwin" else None
+        env = _safe_env(exec_dir, self._extra_env_cache) if self._backend == "darwin" else None
         cwd = exec_dir if self._backend == "darwin" else None
 
         try:
@@ -211,7 +224,11 @@ class Sandbox:
             profile = _make_sbpl(exec_dir, readonly=readonly, no_network=no_network)
             return ["sandbox-exec", "-p", profile, *inner_cmd]
         elif self._backend == "bwrap":
-            return _make_bwrap(exec_dir, inner_cmd, readonly=readonly, no_network=no_network)
+            return _make_bwrap(
+                exec_dir, inner_cmd,
+                readonly=readonly, no_network=no_network,
+                extra_env=self._extra_env_cache,
+            )
         else:
             raise RuntimeError(f"Sandbox not initialized (backend={self._backend!r})")
 
@@ -219,6 +236,43 @@ class Sandbox:
         if len(text) > self._max_output:
             return text[: self._max_output] + "\n...(truncated)"
         return text
+
+    def _resolve_extra_env(self) -> None:
+        """Materialize env values from config once at startup.
+
+        - `env`  literal values (expanduser applied)
+        - `env_from_cmd`  shell command, stdout becomes the value
+        - `env_passthrough`  copy from the parent env if set
+
+        Empty results are dropped. Failures log and skip.
+        """
+        resolved: dict[str, str] = {}
+        for k, v in self._extra_env_literal.items():
+            expanded = os.path.expanduser(str(v))
+            if expanded:
+                resolved[k] = expanded
+        for k, cmd in self._extra_env_cmd.items():
+            try:
+                result = subprocess.run(
+                    cmd, shell=True, capture_output=True, text=True, timeout=5,
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    resolved[k] = result.stdout.strip()
+                    logger.info("Sandbox env: resolved %s via command", k)
+                else:
+                    logger.warning(
+                        "Sandbox env_from_cmd[%s] failed (rc=%d): %s",
+                        k, result.returncode, result.stderr.strip()[:200],
+                    )
+            except Exception as e:
+                logger.warning("Sandbox env_from_cmd[%s] error: %s", k, e)
+        for k in self._extra_env_passthrough:
+            val = os.environ.get(k)
+            if val:
+                resolved[k] = val
+        self._extra_env_cache = resolved
+        if resolved:
+            logger.info("Sandbox: %d extra env vars loaded: %s", len(resolved), ", ".join(sorted(resolved)))
 
 
 # ── macOS: sandbox-exec (SBPL) ──────────────────────────────────────
@@ -266,6 +320,7 @@ def _make_bwrap(
     *,
     readonly: bool = False,
     no_network: bool = False,
+    extra_env: dict[str, str] | None = None,
 ) -> list[str]:
     real_dir = os.path.realpath(exec_dir)
     args: list[str] = ["bwrap"]
@@ -273,6 +328,16 @@ def _make_bwrap(
     for p in _BWRAP_RO_PATHS:
         if os.path.exists(p):
             args.extend(["--ro-bind", p, p])
+
+    # Any extra env value that looks like an existing filesystem path gets
+    # bind-mounted read-only at the same path inside the sandbox. This keeps
+    # the config generic: users declare `GH_CONFIG_DIR: ~/.config/gh` and the
+    # sandbox exposes the directory automatically.
+    resolved_extra: dict[str, str] = {}
+    for k, v in (extra_env or {}).items():
+        if v and os.path.exists(v):
+            args.extend(["--ro-bind", v, v])
+        resolved_extra[k] = v
 
     args.extend(["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"])
 
@@ -293,6 +358,8 @@ def _make_bwrap(
     args.extend(["--setenv", "PYTHONDONTWRITEBYTECODE", "1"])
     args.extend(["--setenv", "TERM", "dumb"])
     args.extend(["--setenv", "PATH", "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"])
+    for k, v in resolved_extra.items():
+        args.extend(["--setenv", k, v])
 
     args.extend(inner_cmd)
     return args
@@ -301,7 +368,7 @@ def _make_bwrap(
 # ── Helpers ─────────────────────────────────────────────────────────
 
 
-def _safe_env(exec_dir: str) -> dict[str, str]:
+def _safe_env(exec_dir: str, extra: dict[str, str] | None = None) -> dict[str, str]:
     safe = {
         "PATH": "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin",
         "HOME": exec_dir,
@@ -315,4 +382,6 @@ def _safe_env(exec_dir: str) -> dict[str, str]:
         val = os.environ.get(key)
         if val:
             safe[key] = val
+    if extra:
+        safe.update(extra)
     return safe

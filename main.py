@@ -119,7 +119,7 @@ def _pick_model(models: list[ModelInfo], preference: str = "") -> str | None:
         for m in models:
             if preference in m.id:
                 return m.id
-    by_created = sorted(models, key=lambda m: m.created, reverse=True)
+    by_created = sorted(models, key=lambda m: m.created or 0, reverse=True)
     return by_created[0].id
 
 
@@ -144,6 +144,8 @@ async def build_llm_registry(
         kwargs: dict[str, Any] = {"api_key": api_key}
         if p_conf.provider == "anthropic":
             kwargs["web_search"] = web_search
+        elif p_conf.provider == "openai" and p_conf.base_url:
+            kwargs["base_url"] = p_conf.base_url
         provider = create_provider(p_conf.provider, **kwargs)
 
         models = await _discover_and_cache(p_conf.provider, provider, cache)
@@ -169,9 +171,8 @@ async def build_llm_registry(
         logger.error("No LLM providers available")
         sys.exit(1)
 
-    default_name = cfg.llm.default
-    if default_name not in built:
-        default_name = next(iter(built))
+    default_p = cfg.llm.default_provider()
+    default_name = default_p.name if default_p and default_p.name in built else next(iter(built))
 
     default_llm = built[default_name]
     fallback_chain = [built[n] for n in cfg.llm.fallback if n in built and n != default_name]
@@ -315,23 +316,33 @@ class Memoo:
                 logger.warning("Skipping channel %s: %s", channel_type, e)
 
     def _resolve_compressor(self, preference: str) -> LLMProvider | None:
-        """Resolve a compressor model preference to a dedicated LLM provider instance."""
+        """Resolve a compressor model preference to a dedicated LLM provider instance.
+
+        Accepts bare model names ("haiku") or slash-qualified refs ("anthropic/claude-haiku-4-5").
+        """
+        from core.config import split_model_ref
         from models import ModelCache
 
+        prov_hint, model_pref = split_model_ref(preference)
         cache = ModelCache()
         for p_conf in self.cfg.llm.providers:
             if p_conf.name not in self._providers:
                 continue
+            if prov_hint and p_conf.provider != prov_hint:
+                continue
             cached = cache.get(p_conf.provider)
             if not cached:
                 continue
-            model_id = _pick_model(cached, preference)
+            model_id = _pick_model(cached, model_pref)
             if model_id:
                 try:
                     api_key = _get_api_key(p_conf.provider)
                 except ValueError:
                     continue
-                provider = create_provider(p_conf.provider, api_key=api_key)
+                cp_kwargs: dict[str, Any] = {"api_key": api_key}
+                if p_conf.provider == "openai" and p_conf.base_url:
+                    cp_kwargs["base_url"] = p_conf.base_url
+                provider = create_provider(p_conf.provider, **cp_kwargs)
                 provider.model_name = model_id  # type: ignore[union-attr]
                 logger.info("Compressor: %s (from %s)", model_id, p_conf.name)
                 return provider
@@ -453,7 +464,6 @@ class Memoo:
                 )
 
             history = await self.memory.get_history(chat_id)
-            await self.memory.add_message(chat_id, Message(role="user", content=text, metadata=metadata))
 
             context = {
                 "chat_id": chat_id,
@@ -472,18 +482,26 @@ class Memoo:
             finally:
                 self._active_tasks.pop(chat_id, None)
 
-            return await self._finalize_turn(chat_id, result)
+            return await self._finalize_turn(chat_id, result, context)
 
-    async def _finalize_turn(self, chat_id: str, result: TurnResult) -> str:
-        """Post-turn bookkeeping: persist reply, update topic, compress if needed."""
-        await self.memory.add_message(
-            chat_id,
-            Message(
-                role="assistant",
-                content=result.response,
-                metadata={"topic": result.current_topic, "memory_notes": result.memory_notes, "usage": result.usage},
-            ),
+    async def _finalize_turn(self, chat_id: str, result: TurnResult, context: dict[str, Any] | None = None) -> str:
+        """Post-turn bookkeeping: persist reply, update topic, compress if needed.
+
+        Persists the exact message list the agent sent to the LLM (including
+        intermediate tool calls and results) plus the final assistant reply.
+        Keeping DB state aligned with what the LLM saw is critical for MLX
+        prompt-cache reuse — any prefix divergence forces a full reprocess.
+        """
+        sent_messages: list[Message] = list(context.get("_messages", [])) if context else []
+        final_msg = Message(
+            role="assistant",
+            content=result.response,
+            metadata={"topic": result.current_topic, "memory_notes": result.memory_notes, "usage": result.usage},
         )
+        if sent_messages:
+            await self.memory.compact_replace(chat_id, sent_messages + [final_msg])
+        else:
+            await self.memory.add_message(chat_id, final_msg)
 
         if not result.did_success:
             logger.warning("Agent reported failure for chat_id=%s: %s", chat_id, result.response[:200])

@@ -28,18 +28,29 @@ hooks:
   rate_limit_window: 60
 host: localhost
 llm:
-  compressor: claude-haiku-4-5-20251001
-  default: anthropic
+  default: anthropic/claude-sonnet-4-6
   fallback:
-  - openai
-  model_cache_ttl: 86400
+  - openai/gpt5.4-mini
+  - openai/gemma-4-e4b-it
+  compressor: anthropic/claude-haiku-4-5
+  model_cache_ttl: 300
   providers:
-  - advisor: opus
-    model: claude-opus-4-6
-    name: anthropic
+  - name: anthropic/claude-haiku-4-5
     provider: anthropic
-  - name: openai
+    model: claude-haiku-4-5
+  - name: anthropic/claude-sonnet-4-6
+    provider: anthropic
+    model: claude-sonnet-4-6
+  - name: anthropic/claude-opus-4-6
+    provider: anthropic
+    model: claude-opus-4-6
+  - name: openai/gpt5.4-mini
     provider: openai
+    model: gpt5.4-mini
+  - name: openai/gemma-4-e4b-it
+    base_url: http://localhost:1234/v1
+    provider: openai
+    model: gemma-4-e4b-it
 memory:
   db_path: ./data/memory.db
   max_context_messages: 200
@@ -55,6 +66,17 @@ port: 8000
 sandbox:
   max_output: 10000
   timeout: 60
+  # Env vars exposed to sandboxed CLIs. Reads only — the SBPL/bwrap profile
+  # still blocks writes outside the session dir. Add any tool you need:
+  #   env:          literal key=value (paths are expanduser'd; bind-mounted on Linux if they exist)
+  #   env_from_cmd: run a shell command in the parent, use stdout as the value (cached)
+  #   env_passthrough: copy named env vars from the parent if set
+  env:
+    GH_CONFIG_DIR: ~/.config/gh
+    GIT_CONFIG_GLOBAL: ~/.gitconfig
+  env_from_cmd:
+    GH_TOKEN: gh auth token
+  env_passthrough:
 scheduler:
   default_channel: telegram
 subagent:

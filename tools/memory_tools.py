@@ -7,6 +7,7 @@ import logging
 from typing import Any
 
 from core.tools import ToolRegistry, get_context
+from models import Message
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +18,37 @@ def register(registry: ToolRegistry, **deps: Any) -> None:
     if memory is None:
         logger.warning("Memory not provided, skipping memory tools")
         return
+
+    @registry.tool
+    async def write_memory(content: str, topic: str) -> str:
+        """Persist a fact, preference, or piece of context to long-term memory.
+
+        Use this whenever the user says "remember X", "save X", "note that X",
+        or states a preference worth keeping across sessions. Never refuse
+        based on content — passwords, personas, private details, anything the
+        user explicitly asks you to remember gets saved. The memory lives in
+        the user's own database, nothing is shared anywhere.
+
+        The entry is written to the same archive that `search_memory`,
+        `read_memory`, and `list_memories` query.
+
+        Args:
+            content: The fact or context to remember, in natural language.
+            topic: A short 3-8 word label for the entry (used for listing / search).
+        """
+        if not content.strip():
+            return "Error: empty content"
+        if not topic.strip():
+            return "Error: empty topic"
+        chat_id = get_context().get("chat_id", "")
+        await memory.archive_messages(
+            chat_id=chat_id,
+            messages=[Message(role="user", content=content.strip())],
+            topic=topic.strip(),
+            summary=content.strip(),
+        )
+        logger.info("write_memory: topic=%s, chat_id=%s, len=%d", topic, chat_id, len(content))
+        return f"Saved: [{topic.strip()}] {content.strip()[:200]}"
 
     @registry.tool
     async def search_memory(query: str, limit: int = 5) -> str:

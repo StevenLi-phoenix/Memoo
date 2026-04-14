@@ -22,11 +22,17 @@ def register(registry: ToolRegistry, **deps: Any) -> None:
     cfg = deps.get("config")
     timeout = cfg.sandbox.timeout if cfg else 300
     max_output = cfg.sandbox.max_output if cfg else 10_000
+    env = cfg.sandbox.env if cfg else {}
+    env_from_cmd = cfg.sandbox.env_from_cmd if cfg else {}
+    env_passthrough = cfg.sandbox.env_passthrough if cfg else []
 
     sb = Sandbox(
         base_dir=deps.get("sandbox_dir", "./sandbox"),
         timeout=timeout,
         max_output=max_output,
+        env=env,
+        env_from_cmd=env_from_cmd,
+        env_passthrough=env_passthrough,
     )
 
     def _session_id() -> str:

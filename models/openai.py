@@ -16,11 +16,14 @@ logger = logging.getLogger(__name__)
 class OpenAIProvider:
     """OpenAI API provider with streaming support."""
 
-    def __init__(self, api_key: str, model: str = "") -> None:
-        self._client = openai.AsyncOpenAI(api_key=api_key)
+    def __init__(self, api_key: str, model: str = "", base_url: str = "") -> None:
+        client_kwargs: dict[str, Any] = {"api_key": api_key}
+        if base_url:
+            client_kwargs["base_url"] = base_url
+        self._client = openai.AsyncOpenAI(**client_kwargs)
         self._model = model
         if model:
-            logger.info("OpenAI provider: model=%s", model)
+            logger.info("OpenAI provider: model=%s base_url=%s", model, base_url or "default")
 
     @property
     def model_name(self) -> str:
@@ -46,7 +49,7 @@ class OpenAIProvider:
         messages: list[Message],
         system: str | None = None,
         tools: list[dict[str, Any]] | None = None,
-        max_tokens: int = 128000,
+        max_tokens: int = 4096,
         output_schema: dict[str, Any] | None = None,
     ) -> LLMResponse:
         api_messages = self._build_messages(messages, system)
@@ -61,8 +64,10 @@ class OpenAIProvider:
         if oai_tools:
             kwargs["tools"] = oai_tools
 
-        # Structured JSON output
-        if output_schema:
+        # Structured JSON output. Skip when tools are present: llama.cpp/LM Studio
+        # backends reject combining tool-call grammar with response_format
+        # ("Cannot combine structured output constraints with lazy grammar").
+        if output_schema and not oai_tools:
             kwargs["response_format"] = {
                 "type": "json_schema",
                 "json_schema": {"name": "agent_response", "strict": True, "schema": output_schema},
