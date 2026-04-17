@@ -20,6 +20,14 @@ logger = logging.getLogger(__name__)
 class ProviderConfig:
     name: str = ""
     provider: str = ""
+    base_url: str = ""
+    allow_model_discovery: bool = False
+
+
+@dataclass
+class ModelConfig:
+    name: str = ""
+    provider: str = ""
     model: str = ""
     advisor: str = ""
     base_url: str = ""
@@ -27,8 +35,9 @@ class ProviderConfig:
 
 @dataclass
 class LLMConfig:
-    default: str = "anthropic"
+    default: str = ""
     providers: list[ProviderConfig] = field(default_factory=list)
+    models: list[ModelConfig] = field(default_factory=list)
     fallback: list[str] = field(default_factory=list)
     compressor: str = ""  # model name/preference for context compression (e.g. "haiku", "gpt-5.4-mini")
     model_cache_ttl: int = 86400  # seconds (24h)
@@ -49,8 +58,21 @@ class LLMConfig:
                 return p
         return None
 
-    def default_provider(self) -> ProviderConfig | None:
-        return self.resolve_provider(self.default)
+    def resolve_model(self, ref: str) -> ModelConfig | None:
+        """Find a configured model by exact alias first, then by suffix-like prefix."""
+        if not ref or not self.models:
+            return None
+        for m in self.models:
+            if m.name == ref:
+                return m
+        prefix = ref + "/"
+        for m in self.models:
+            if m.name.startswith(prefix):
+                return m
+        return None
+
+    def default_model(self) -> ModelConfig | None:
+        return self.resolve_model(self.default)
 
 
 def split_model_ref(ref: str) -> tuple[str, str]:
@@ -198,11 +220,22 @@ class AppConfig:
             ProviderConfig(
                 name=p.get("name", p.get("provider", "")),
                 provider=p.get("provider", ""),
-                model=p.get("model", ""),
-                advisor=p.get("advisor", ""),
                 base_url=p.get("base_url", ""),
+                allow_model_discovery=bool(p.get("allow_model_discovery", False)),
             )
             for p in llm_raw.get("providers", [])
+            if isinstance(p, dict)
+        ]
+        cfg.llm.models = [
+            ModelConfig(
+                name=m.get("name", ""),
+                provider=m.get("provider", ""),
+                model=m.get("model", m.get("name", "").split("/", 1)[-1]),
+                advisor=m.get("advisor", ""),
+                base_url=m.get("base_url", ""),
+            )
+            for m in llm_raw.get("models", [])
+            if isinstance(m, dict)
         ]
 
         # Agent
@@ -283,11 +316,12 @@ class AppConfig:
     def save(self) -> None:
         """Persist current config back to YAML file."""
         data = self.to_dict()
-        # Strip falsy optional fields from providers for clean YAML
-        for p in data.get("llm", {}).get("providers", []):
-            for k in list(p):
-                if not p[k]:
-                    del p[k]
+        # Strip falsy optional fields from LLM entries for clean YAML.
+        for section in ("providers", "models"):
+            for entry in data.get("llm", {}).get(section, []):
+                for key in list(entry):
+                    if entry[key] in ("", None, [], {}):
+                        del entry[key]
         Path(self._path).write_text(yaml.dump(data, default_flow_style=False, allow_unicode=True), encoding="utf-8")
         logger.info("Config saved to %s", self._path)
 
@@ -310,11 +344,20 @@ class AppConfig:
                     {
                         "name": p.name,
                         "provider": p.provider,
-                        "model": p.model,
-                        "advisor": p.advisor,
                         "base_url": p.base_url,
+                        "allow_model_discovery": p.allow_model_discovery,
                     }
                     for p in self.llm.providers
+                ],
+                "models": [
+                    {
+                        "name": m.name,
+                        "provider": m.provider,
+                        "model": m.model,
+                        "advisor": m.advisor,
+                        "base_url": m.base_url,
+                    }
+                    for m in self.llm.models
                 ],
                 "fallback": self.llm.fallback,
                 "compressor": self.llm.compressor,

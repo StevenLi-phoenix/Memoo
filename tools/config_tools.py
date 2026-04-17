@@ -1,7 +1,8 @@
 """Config tools — agent can read and update runtime configuration.
 
 All config changes go through a single update_config() entry point.
-Model-related keys (llm.model, llm.compressor) get fuzzy resolution and hot-reload.
+Model-related keys (llm.model, llm.compressor) resolve against configured
+LLM model aliases and hot-reload the live app state.
 Other keys go through pre-change verification before persisting.
 """
 
@@ -12,9 +13,21 @@ import logging
 import os
 from typing import Any
 
+from core.config import ModelConfig
 from core.tools import ToolRegistry
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_model_lookup(value: str) -> str:
+    """Normalize user-entered model fragments for fuzzy lookup."""
+    value = value.strip().lower().replace("_", "-").replace(" ", "-")
+    for prefix in ("anthropic/", "openai/", "localhost/"):
+        if value.startswith(prefix):
+            value = value[len(prefix) :]
+    if value.startswith("claude-"):
+        value = value[len("claude-") :]
+    return value
 
 
 def register(registry: ToolRegistry, **deps: Any) -> None:
@@ -44,7 +57,7 @@ def register(registry: ToolRegistry, **deps: Any) -> None:
         if not key:
             return _all_keys_help(config)
         if key in ("llm.model", "llm.compressor"):
-            return _model_options_help(key, config)
+            return _model_options_help(key, config, app)
         parts = key.split(".")
         val = _snapshot(config, parts)
         if val is _INVALID:
@@ -93,104 +106,196 @@ def register(registry: ToolRegistry, **deps: Any) -> None:
         return f"Config updated: {key} = {parsed_value}"
 
 
-def _resolve_model(preference: str, providers: list[Any]) -> tuple[str | None, Any | None]:
-    """Fuzzy-resolve a model name across all providers. Returns (model_id, provider_config).
+def _resolve_model(preference: str, config: Any) -> Any | None:
+    """Fuzzy-resolve a configured model alias from llm.models."""
+    preference = preference.strip()
+    if not preference:
+        return None
+    normalized = _normalize_model_lookup(preference)
 
-    Accepts bare names ("haiku") or slash-qualified refs ("anthropic/claude-haiku-4-5").
-    """
-    from core.config import split_model_ref
-    from models import ModelCache
+    for model in config.llm.models:
+        if model.name == preference or model.model == preference:
+            return model
+        if _normalize_model_lookup(model.name) == normalized or _normalize_model_lookup(model.model) == normalized:
+            return model
 
-    prov_hint, model_pref = split_model_ref(preference)
-    cache = ModelCache()
-    for p in providers:
-        if prov_hint and p.provider != prov_hint:
+    alias_matches = [
+        m for m in config.llm.models if preference in m.name or normalized in _normalize_model_lookup(m.name)
+    ]
+    if alias_matches:
+        return alias_matches[0]
+
+    model_matches = [
+        m for m in config.llm.models if preference in m.model or normalized in _normalize_model_lookup(m.model)
+    ]
+    if model_matches:
+        return model_matches[0]
+
+    return None
+
+
+def _resolve_discovered_model(preference: str, config: Any, app: Any) -> ModelConfig | None:
+    """Resolve a model from discovered provider listings and promote it into llm.models."""
+    if not app:
+        return None
+
+    preference = preference.strip()
+    if not preference:
+        return None
+    normalized = _normalize_model_lookup(preference)
+
+    discovered = getattr(app, "discovered_models", {}) or {}
+    for provider in config.llm.providers:
+        if not provider.allow_model_discovery:
             continue
-        cached = cache.get(p.provider)
-        if not cached:
+        models = discovered.get(provider.name, [])
+        if not models:
             continue
-        exact = [m for m in cached if m.id == model_pref]
-        matches = exact or [m for m in cached if model_pref in m.id]
-        if matches:
-            resolved = exact[0].id if exact else sorted(matches, key=lambda x: x.created or 0, reverse=True)[0].id
-            return resolved, p
-    return None, None
+
+        exact = next((info for info in models if info.id == preference), None)
+        normalized_exact = next((info for info in models if _normalize_model_lookup(info.id) == normalized), None)
+        match = (
+            exact
+            or normalized_exact
+            or next(
+                (info for info in models if preference in info.id or normalized in _normalize_model_lookup(info.id)),
+                None,
+            )
+        )
+        if not match:
+            continue
+
+        existing = next((model for model in config.llm.models if model.name == f"{provider.name}/{match.id}"), None)
+        if existing:
+            return existing
+
+        promoted = ModelConfig(
+            name=f"{provider.name}/{match.id}",
+            provider=provider.name,
+            model=match.id,
+            base_url=provider.base_url,
+        )
+        config.llm.models.append(promoted)
+        logger.info("Promoted discovered model into config: %s", promoted.name)
+        return promoted
+
+    return None
 
 
-def _list_available_models(providers: list[Any]) -> str:
-    """List available model IDs across all providers."""
-    from models import ModelCache
+def _list_available_models(config: Any) -> str:
+    """List configured model aliases."""
+    return ", ".join(model.name for model in config.llm.models)
 
-    cache = ModelCache()
-    all_models: list[str] = []
-    for p in providers:
-        cached = cache.get(p.provider)
-        if cached:
-            all_models.extend(m.id for m in sorted(cached, key=lambda x: x.created or 0, reverse=True)[:5])
-    return ", ".join(all_models)
+
+def _list_available_models_with_discovery(config: Any, app: Any) -> str:
+    """List configured aliases plus discovered model IDs from enabled providers."""
+    configured = [model.name for model in config.llm.models]
+    discovered_items: list[str] = []
+    discovered = getattr(app, "discovered_models", {}) or {}
+    for provider in config.llm.providers:
+        if not provider.allow_model_discovery:
+            continue
+        for info in discovered.get(provider.name, []):
+            discovered_items.append(info.id)
+    combined = configured + [item for item in discovered_items if item not in configured]
+    return ", ".join(combined)
+
+
+def _build_live_provider(config: Any, model: ModelConfig) -> Any | None:
+    provider_conf = config.llm.resolve_provider(model.provider)
+    if not provider_conf:
+        return None
+
+    api_key_env = {"anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY"}
+    api_key = os.environ.get(api_key_env.get(provider_conf.provider, ""), "")
+    if not api_key:
+        return None
+
+    try:
+        from models import create_provider
+
+        kwargs: dict[str, Any] = {"api_key": api_key}
+        base_url = model.base_url or provider_conf.base_url
+        if provider_conf.provider == "anthropic":
+            kwargs["web_search"] = config.tools.web_search
+        elif provider_conf.provider == "openai" and base_url:
+            kwargs["base_url"] = base_url
+
+        provider = create_provider(provider_conf.provider, **kwargs)
+        provider.model_name = model.model  # type: ignore[union-attr]
+        if provider_conf.provider == "anthropic" and model.advisor:
+            provider._advisor_model = model.advisor  # type: ignore[union-attr]
+        return provider
+    except Exception:
+        logger.exception("Failed to build live provider for %s", model.name)
+        return None
+
+
+def _sync_live_model_state(config: Any, app: Any) -> None:
+    if not app:
+        return
+    providers = getattr(app, "_providers", {}) or {}
+    default_model = config.llm.resolve_model(config.llm.default)
+    if default_model and config.llm.default not in providers:
+        live_provider = _build_live_provider(config, default_model)
+        if live_provider:
+            providers[config.llm.default] = live_provider
+    if config.llm.default in providers:
+        app.llm = providers[config.llm.default]
+    app.fallback_llms = [
+        providers[name] for name in config.llm.fallback if name in providers and name != config.llm.default
+    ]
+    agent = getattr(app, "agent", None)
+    if agent:
+        if getattr(app, "llm", None):
+            agent._llm = app.llm
+        agent._fallback_llms = list(app.fallback_llms)
 
 
 def _update_model(value: str, config: Any, app: Any) -> str:
-    """Handle llm.model: resolve model name + hot-reload default provider."""
-    resolved, p_conf = _resolve_model(value, config.llm.providers)
+    """Handle llm.model: switch the default configured model alias."""
+    resolved = _resolve_model(value, config)
+    promoted = False
     if not resolved:
-        return f"Model '{value}' not found. Available: {_list_available_models(config.llm.providers)}"
+        resolved = _resolve_discovered_model(value, config, app)
+        promoted = resolved is not None
+    if not resolved:
+        return f"Model '{value}' not found. Available: {_list_available_models_with_discovery(config, app)}"
 
-    # Find the default provider's config entry
-    default_p = config.llm.default_provider()
-    if not default_p:
-        return "No default provider configured."
-
-    # If resolved model belongs to a different provider, update the default
-    if p_conf.name != default_p.name:
-        old_default = config.llm.default
-        config.llm.default = p_conf.name
-        logger.info("Default provider switched: %s -> %s (model %s)", old_default, p_conf.name, resolved)
-
-    old = p_conf.model
-    p_conf.model = resolved
+    old = config.llm.default
+    config.llm.default = resolved.name
     config.save()
-
-    # Hot-reload the live provider
-    current_default = config.llm.default_provider()
-    if app and hasattr(app, "llm") and app.llm:
-        if current_default and p_conf.name == current_default.name and hasattr(app.llm, "model_name"):
-            app.llm.model_name = resolved  # type: ignore[union-attr]
-            logger.info("Hot-reloaded model: %s -> %s", old, resolved)
-            return f"Model: {old} -> {resolved} (live)"
-
-    return f"Model set to '{resolved}' for '{p_conf.name}'."
+    _sync_live_model_state(config, app)
+    logger.info("Default model switched: %s -> %s", old or "unset", resolved.name)
+    if promoted:
+        return f"Model: {old or '(unset)'} -> {resolved.name} (added to config)"
+    return f"Model: {old or '(unset)'} -> {resolved.name}"
 
 
 def _update_compressor(value: str, config: Any, app: Any) -> str:
-    """Handle llm.compressor: resolve model name + create dedicated provider + hot-reload."""
-    resolved, p_conf = _resolve_model(value, config.llm.providers)
+    """Handle llm.compressor: switch the configured compressor alias."""
+    resolved = _resolve_model(value, config)
+    promoted = False
     if not resolved:
-        return f"Model '{value}' not found. Available: {_list_available_models(config.llm.providers)}"
+        resolved = _resolve_discovered_model(value, config, app)
+        promoted = resolved is not None
+    if not resolved:
+        return f"Model '{value}' not found. Available: {_list_available_models_with_discovery(config, app)}"
 
     old = "default"
     if app and getattr(app, "agent", None):
         old = app.agent._compressor.model_name
 
-        # Create a dedicated provider instance (avoid sharing with fallback)
-        api_key_env = {"anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY"}
-        api_key = os.environ.get(api_key_env.get(p_conf.provider, ""), "")
-        if not api_key:
-            return f"No API key for provider '{p_conf.provider}'."
+        new_compressor = _build_live_provider(config, resolved)
+        if not new_compressor:
+            return f"Error creating compressor provider for '{resolved.name}'."
+        app.agent._compressor = new_compressor
 
-        try:
-            from models import create_provider
-
-            new_compressor = create_provider(p_conf.provider, api_key=api_key)
-            new_compressor.model_name = resolved  # type: ignore[union-attr]
-            app.agent._compressor = new_compressor
-        except Exception as e:
-            return f"Error creating compressor provider: {e}"
-
-    config.llm.compressor = resolved
+    config.llm.compressor = resolved.name
     config.save()
-    logger.info("Compressor: %s -> %s (live)", old, resolved)
-    return f"Compressor: {old} -> {resolved} (live)"
+    logger.info("Compressor: %s -> %s (live)", old, resolved.name)
+    suffix = " (live, added to config)" if promoted else " (live)"
+    return f"Compressor: {old} -> {resolved.name}{suffix}"
 
 
 def _all_keys_help(config: Any) -> str:
@@ -231,29 +336,34 @@ def _all_keys_help(config: Any) -> str:
     return "\n".join(lines)
 
 
-def _model_options_help(key: str, config: Any) -> str:
-    """List available models for llm.model or llm.compressor."""
-    from models import ModelCache
-
-    cache = ModelCache()
+def _model_options_help(key: str, config: Any, app: Any = None) -> str:
+    """List configured models plus any discovered models for llm.model or llm.compressor."""
     current = ""
     if key == "llm.model":
-        default_p = config.llm.default_provider()
-        current = default_p.model if default_p else ""
+        current = config.llm.default
     elif key == "llm.compressor":
-        current = config.llm.compressor or "(default: last fallback provider)"
+        current = config.llm.compressor or "(disabled)"
 
     lines = [f"{key} — current: {current}", ""]
-    lines.append("Available models:")
-    for p in config.llm.providers:
-        cached = cache.get(p.provider)
-        if not cached:
-            continue
-        models = sorted(cached, key=lambda x: x.created or 0, reverse=True)[:8]
-        lines.append(f"  {p.name} ({p.provider}):")
-        for m in models:
-            marker = " ← current" if m.id == current else ""
-            lines.append(f"    {m.id}{marker}")
+    lines.append("Configured models:")
+    for model in config.llm.models:
+        marker = " ← current" if model.name == current else ""
+        source = f"{model.provider} -> {model.model}"
+        lines.append(f"  {model.name} ({source}){marker}")
+
+    discovered = getattr(app, "discovered_models", {}) if app else {}
+    if discovered:
+        lines.append("")
+        lines.append("Discovered models:")
+        for provider in config.llm.providers:
+            if not provider.allow_model_discovery:
+                continue
+            models = discovered.get(provider.name, [])
+            if not models:
+                continue
+            lines.append(f"  {provider.name}:")
+            for info in models:
+                lines.append(f"    {info.id}")
 
     lines.append("")
     lines.append(f"Set with: update_config('{key}', '<name or substring>')")

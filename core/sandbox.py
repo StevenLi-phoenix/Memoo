@@ -182,7 +182,9 @@ class Sandbox:
         try:
             result = subprocess.run(
                 ["sandbox-exec", "-p", "(version 1)(allow default)", "echo", "ok"],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True,
+                text=True,
+                timeout=5,
             )
             if result.returncode != 0:
                 logger.error("sandbox-exec smoke test failed: %s", result.stderr)
@@ -200,7 +202,9 @@ class Sandbox:
         try:
             result = subprocess.run(
                 ["bwrap", "--ro-bind", "/", "/", "echo", "ok"],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True,
+                text=True,
+                timeout=5,
             )
             if result.returncode != 0:
                 logger.error("bwrap smoke test failed: %s", result.stderr)
@@ -225,8 +229,10 @@ class Sandbox:
             return ["sandbox-exec", "-p", profile, *inner_cmd]
         elif self._backend == "bwrap":
             return _make_bwrap(
-                exec_dir, inner_cmd,
-                readonly=readonly, no_network=no_network,
+                exec_dir,
+                inner_cmd,
+                readonly=readonly,
+                no_network=no_network,
                 extra_env=self._extra_env_cache,
             )
         else:
@@ -254,7 +260,11 @@ class Sandbox:
         for k, cmd in self._extra_env_cmd.items():
             try:
                 result = subprocess.run(
-                    cmd, shell=True, capture_output=True, text=True, timeout=5,
+                    cmd,
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
                 )
                 if result.returncode == 0 and result.stdout.strip():
                     resolved[k] = result.stdout.strip()
@@ -262,7 +272,9 @@ class Sandbox:
                 else:
                     logger.warning(
                         "Sandbox env_from_cmd[%s] failed (rc=%d): %s",
-                        k, result.returncode, result.stderr.strip()[:200],
+                        k,
+                        result.returncode,
+                        result.stderr.strip()[:200],
                     )
             except Exception as e:
                 logger.warning("Sandbox env_from_cmd[%s] error: %s", k, e)
@@ -289,15 +301,17 @@ def _make_sbpl(exec_dir: str, *, readonly: bool = False, no_network: bool = Fals
         parts.append('(allow file-write* (subpath "/dev"))')
     else:
         parts.append(f'(allow file-write* (subpath "{real_dir}") (subpath "/dev"))')
-    parts.extend([
-        "(allow process-exec*)",
-        "(allow process-fork)",
-        "(allow sysctl-read)",
-        "(allow mach-lookup)",
-        "(allow mach-register)",
-        "(allow ipc-posix*)",
-        "(allow signal)",
-    ])
+    parts.extend(
+        [
+            "(allow process-exec*)",
+            "(allow process-fork)",
+            "(allow sysctl-read)",
+            "(allow mach-lookup)",
+            "(allow mach-register)",
+            "(allow ipc-posix*)",
+            "(allow signal)",
+        ]
+    )
     if not no_network:
         parts.append("(allow network*)")
     return "\n".join(parts)
@@ -306,11 +320,25 @@ def _make_sbpl(exec_dir: str, *, readonly: bool = False, no_network: bool = Fals
 # ── Linux: bubblewrap ───────────────────────────────────────────────
 
 _BWRAP_RO_PATHS = [
-    "/usr", "/bin", "/sbin", "/lib", "/lib64", "/lib32", "/opt",
-    "/etc/alternatives", "/etc/resolv.conf", "/etc/hosts", "/etc/nsswitch.conf",
-    "/etc/ssl", "/etc/pki", "/etc/ca-certificates",
-    "/etc/ld.so.cache", "/etc/ld.so.conf", "/etc/ld.so.conf.d",
-    "/etc/passwd", "/etc/group",
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/lib64",
+    "/lib32",
+    "/opt",
+    "/etc/alternatives",
+    "/etc/resolv.conf",
+    "/etc/hosts",
+    "/etc/nsswitch.conf",
+    "/etc/ssl",
+    "/etc/pki",
+    "/etc/ca-certificates",
+    "/etc/ld.so.cache",
+    "/etc/ld.so.conf",
+    "/etc/ld.so.conf.d",
+    "/etc/passwd",
+    "/etc/group",
 ]
 
 

@@ -441,9 +441,7 @@ async def main() -> None:
     while _running:
         try:
             with patch_stdout():
-                prompt_task = asyncio.ensure_future(
-                    session.prompt_async([("class:prompt", "You: ")])
-                )
+                prompt_task = asyncio.ensure_future(session.prompt_async([("class:prompt", "You: ")]))
                 shutdown_wait = asyncio.ensure_future(shutdown_event.wait())
 
                 done, pending = await asyncio.wait(

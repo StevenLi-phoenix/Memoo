@@ -3,6 +3,8 @@
 import pytest
 
 from core.commands import COMMANDS, _format_duration, handle_command
+from core.config import AppConfig, ModelConfig, ProviderConfig
+from models import ModelInfo
 
 
 class TestCommands:
@@ -73,6 +75,34 @@ class TestCommands:
     async def test_model_no_arg(self):
         result = await handle_command("/model", "test", {})
         assert result == "Not available."
+
+    async def test_model_lists_discovered_models_for_enabled_provider(self):
+        class MockLLM:
+            model_name = "claude-sonnet-4-6"
+
+        class MockApp:
+            llm = MockLLM()
+            discovered_models = {
+                "anthropic": [
+                    ModelInfo(id="claude-haiku-4-5", provider="anthropic"),
+                    ModelInfo(id="claude-sonnet-4-6", provider="anthropic"),
+                    ModelInfo(id="claude-opus-4-6", provider="anthropic"),
+                ]
+            }
+
+        cfg = AppConfig()
+        cfg.llm.default = "anthropic/claude-sonnet-4-6"
+        cfg.llm.providers = [
+            ProviderConfig(name="anthropic", provider="anthropic", allow_model_discovery=True),
+        ]
+        cfg.llm.models = [
+            ModelConfig(name="anthropic/claude-sonnet-4-6", provider="anthropic", model="claude-sonnet-4-6"),
+        ]
+
+        result = await handle_command("/model", "test", {"app": MockApp(), "config": cfg})
+        assert "Configured models" in result
+        assert "Discovered models" in result
+        assert "claude-opus-4-6" in result
 
     async def test_not_a_command(self):
         result = await handle_command("hello", "test", {})

@@ -8,6 +8,54 @@ from core.config import AppConfig
 
 
 class TestConfigRoundTrip:
+    def test_loads_new_llm_config_shape(self, tmp_path) -> None:
+        config_file = tmp_path / "config.yaml"
+        initial = {
+            "llm": {
+                "default": "anthropic/claude-sonnet-4-6",
+                "fallback": ["openai/gpt5.4-mini"],
+                "compressor": "anthropic/claude-haiku-4-5",
+                "providers": [
+                    {
+                        "name": "anthropic",
+                        "provider": "anthropic",
+                        "allow_model_discovery": True,
+                    },
+                    {
+                        "name": "localhost",
+                        "provider": "openai",
+                        "base_url": "http://localhost:1234/v1",
+                    },
+                ],
+                "models": [
+                    {
+                        "name": "anthropic/claude-sonnet-4-6",
+                        "provider": "anthropic",
+                        "model": "claude-sonnet-4-6",
+                    },
+                    {
+                        "name": "localhost/gemma-4-e4b-it",
+                        "provider": "localhost",
+                        "model": "gemma-4-e4b-it",
+                    },
+                ],
+            },
+        }
+        config_file.write_text(yaml.dump(initial), encoding="utf-8")
+
+        cfg = AppConfig.load(str(config_file))
+
+        assert cfg.llm.default == "anthropic/claude-sonnet-4-6"
+        assert [p.name for p in cfg.llm.providers] == ["anthropic", "localhost"]
+        assert cfg.llm.providers[0].allow_model_discovery is True
+        assert cfg.llm.providers[1].base_url == "http://localhost:1234/v1"
+        assert [m.name for m in cfg.llm.models] == [
+            "anthropic/claude-sonnet-4-6",
+            "localhost/gemma-4-e4b-it",
+        ]
+        assert cfg.llm.models[1].provider == "localhost"
+        assert cfg.llm.models[1].model == "gemma-4-e4b-it"
+
     def test_save_preserves_embedding_api_key(self, tmp_path) -> None:
         """Regression: save() must not strip embedding.api_key from config.yaml."""
         config_file = tmp_path / "config.yaml"
@@ -41,6 +89,70 @@ class TestConfigRoundTrip:
 
         reloaded = AppConfig.load(str(config_file))
         assert reloaded.port == 9999
+
+    def test_save_preserves_llm_models(self, tmp_path) -> None:
+        config_file = tmp_path / "config.yaml"
+        initial = {
+            "llm": {
+                "default": "localhost/gemma-4-e4b-it",
+                "providers": [
+                    {
+                        "name": "localhost",
+                        "provider": "openai",
+                        "base_url": "http://localhost:1234/v1",
+                    },
+                ],
+                "models": [
+                    {
+                        "name": "localhost/gemma-4-e4b-it",
+                        "provider": "localhost",
+                        "model": "gemma-4-e4b-it",
+                    },
+                ],
+            },
+        }
+        config_file.write_text(yaml.dump(initial), encoding="utf-8")
+
+        cfg = AppConfig.load(str(config_file))
+        cfg.save()
+
+        reloaded = AppConfig.load(str(config_file))
+        assert reloaded.llm.default == "localhost/gemma-4-e4b-it"
+        assert len(reloaded.llm.providers) == 1
+        assert len(reloaded.llm.models) == 1
+        assert reloaded.llm.models[0].name == "localhost/gemma-4-e4b-it"
+
+    def test_save_preserves_explicit_allow_model_discovery_false(self, tmp_path) -> None:
+        config_file = tmp_path / "config.yaml"
+        initial = {
+            "llm": {
+                "providers": [
+                    {
+                        "name": "openai",
+                        "provider": "openai",
+                        "allow_model_discovery": False,
+                    },
+                ],
+                "models": [
+                    {
+                        "name": "openai/gpt5.4-mini",
+                        "provider": "openai",
+                        "model": "gpt5.4-mini",
+                    },
+                ],
+            },
+        }
+        config_file.write_text(yaml.dump(initial), encoding="utf-8")
+
+        cfg = AppConfig.load(str(config_file))
+        assert cfg.llm.providers[0].allow_model_discovery is False
+
+        cfg.save()
+
+        raw = yaml.safe_load(config_file.read_text(encoding="utf-8"))
+        provider = raw["llm"]["providers"][0]
+        assert "allow_model_discovery" in provider
+        assert provider["allow_model_discovery"] is False
 
 
 class TestDisplayDict:

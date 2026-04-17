@@ -148,20 +148,27 @@ def _cmd_model(arg: str, deps: dict[str, Any]) -> str:
         # Show current model
         llm = getattr(app, "llm", None)
         model_name = llm.model_name if llm else "unknown"
-        lines = [f"**Current model**: `{model_name}`", ""]
+        current_alias = config.llm.default or "unknown"
+        lines = [f"**Current model**: `{current_alias}` (`{model_name}`)", ""]
 
-        # List available from cache
-        from models import ModelCache
+        lines.append("**Configured models**:")
+        for model in config.llm.models:
+            marker = " ← current" if model.name == current_alias else ""
+            lines.append(f"  `{model.name}` -> `{model.model}` via `{model.provider}`{marker}")
 
-        cache = ModelCache()
-        for p in config.llm.providers:
-            cached = cache.get(p.provider)
-            if cached:
-                model_ids = [m.id for m in sorted(cached, key=lambda x: x.created or 0, reverse=True)[:8]]
-                lines.append(f"**{p.name}** ({p.provider}):")
-                for mid in model_ids:
-                    marker = " ← current" if mid == model_name else ""
-                    lines.append(f"  `{mid}`{marker}")
+        discovered = getattr(app, "discovered_models", {}) or {}
+        if discovered:
+            lines.append("")
+            lines.append("**Discovered models**:")
+            for provider in config.llm.providers:
+                if not provider.allow_model_discovery:
+                    continue
+                models = discovered.get(provider.name, [])
+                if not models:
+                    continue
+                lines.append(f"  `{provider.name}`:")
+                for info in models:
+                    lines.append(f"    `{info.id}`")
         lines.append("")
         lines.append("Switch: `/model <name>` (e.g. `/model haiku`)")
         return "\n".join(lines)

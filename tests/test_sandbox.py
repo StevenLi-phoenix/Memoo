@@ -10,9 +10,8 @@ from core.tools import ToolRegistry, set_context
 from tools.builtins import register
 
 _system = platform.system()
-_has_sandbox = (
-    (_system == "Darwin" and shutil.which("sandbox-exec") is not None)
-    or (_system == "Linux" and shutil.which("bwrap") is not None)
+_has_sandbox = (_system == "Darwin" and shutil.which("sandbox-exec") is not None) or (
+    _system == "Linux" and shutil.which("bwrap") is not None
 )
 
 pytestmark = pytest.mark.skipif(not _has_sandbox, reason=f"No sandbox backend on {_system}")

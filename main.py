@@ -18,7 +18,7 @@ from dotenv import load_dotenv
 
 from channels import create_channel
 from core.agent import Agent, TurnResult
-from core.config import AppConfig
+from core.config import AppConfig, ModelConfig, ProviderConfig
 from core.crash import crash_boundary
 from core.crash import init as init_crash_handler
 from core.gateway import Gateway
@@ -109,24 +109,27 @@ async def _discover_and_cache(provider_type: str, provider: Any, cache: ModelCac
     return []
 
 
-def _pick_model(models: list[ModelInfo], preference: str = "") -> str | None:
-    if not models:
-        return None
-    if preference:
-        for m in models:
-            if m.id == preference:
-                return m.id
-        for m in models:
-            if preference in m.id:
-                return m.id
-    by_created = sorted(models, key=lambda m: m.created or 0, reverse=True)
-    return by_created[0].id
+def _provider_cache_key(provider_conf: ProviderConfig, model_conf: ModelConfig | None = None) -> str:
+    base_url = (model_conf.base_url if model_conf else "") or provider_conf.base_url
+    return f"{provider_conf.name}:{base_url}" if base_url else provider_conf.name
+
+
+def _provider_kwargs(provider_conf: ProviderConfig, model_conf: ModelConfig | None, web_search: bool) -> dict[str, Any]:
+    api_key = _get_api_key(provider_conf.provider)
+    kwargs: dict[str, Any] = {"api_key": api_key}
+    if provider_conf.provider == "anthropic":
+        kwargs["web_search"] = web_search
+    elif provider_conf.provider == "openai":
+        base_url = (model_conf.base_url if model_conf else "") or provider_conf.base_url
+        if base_url:
+            kwargs["base_url"] = base_url
+    return kwargs
 
 
 async def build_llm_registry(
     cfg: AppConfig,
 ) -> tuple[LLMProvider, list[LLMProvider], dict[str, list[ModelInfo]], dict[str, LLMProvider]]:
-    """Build LLM providers with model discovery from AppConfig."""
+    """Build model-bound LLM providers from AppConfig."""
     configure_model_cache(ttl=cfg.llm.model_cache_ttl)
     web_search = cfg.tools.web_search
     cache = ModelCache()
@@ -134,45 +137,51 @@ async def build_llm_registry(
     built: dict[str, LLMProvider] = {}
     all_discovered: dict[str, list[ModelInfo]] = {}
 
+    provider_configs: dict[str, ProviderConfig] = {p.name: p for p in cfg.llm.providers}
+
     for p_conf in cfg.llm.providers:
+        if not p_conf.allow_model_discovery:
+            continue
         try:
-            api_key = _get_api_key(p_conf.provider)
+            kwargs = _provider_kwargs(p_conf, None, web_search)
         except ValueError as e:
             logger.warning("Skipping %s: %s", p_conf.name, e)
             continue
 
-        kwargs: dict[str, Any] = {"api_key": api_key}
-        if p_conf.provider == "anthropic":
-            kwargs["web_search"] = web_search
-        elif p_conf.provider == "openai" and p_conf.base_url:
-            kwargs["base_url"] = p_conf.base_url
         provider = create_provider(p_conf.provider, **kwargs)
-
-        models = await _discover_and_cache(p_conf.provider, provider, cache)
+        cache_key = _provider_cache_key(p_conf)
+        models = await _discover_and_cache(cache_key, provider, cache)
         all_discovered[p_conf.name] = models
+        logger.info("%s: discovered %d models", p_conf.name, len(models))
 
-        model_id = _pick_model(models, p_conf.model)
-        if not model_id:
-            logger.warning("No models available for %s, skipping", p_conf.name)
+    for m_conf in cfg.llm.models:
+        p_conf = provider_configs.get(m_conf.provider) or cfg.llm.resolve_provider(m_conf.provider)
+        if not p_conf:
+            logger.warning("Skipping model %s: provider '%s' not found", m_conf.name, m_conf.provider)
             continue
 
-        provider.model_name = model_id  # type: ignore[union-attr]
+        try:
+            kwargs = _provider_kwargs(p_conf, m_conf, web_search)
+        except ValueError as e:
+            logger.warning("Skipping model %s: %s", m_conf.name, e)
+            continue
 
-        if p_conf.provider == "anthropic" and p_conf.advisor:
-            advisor_id = _pick_model(models, p_conf.advisor)
-            if advisor_id and advisor_id != model_id:
-                provider._advisor_model = advisor_id  # type: ignore[union-attr]
-                logger.info("%s: advisor model %s", p_conf.name, advisor_id)
+        provider = create_provider(p_conf.provider, **kwargs)
+        provider.model_name = m_conf.model  # type: ignore[union-attr]
 
-        built[p_conf.name] = provider
-        logger.info("%s: selected model %s (from %d available)", p_conf.name, model_id, len(models))
+        if p_conf.provider == "anthropic" and m_conf.advisor:
+            provider._advisor_model = m_conf.advisor  # type: ignore[union-attr]
+            logger.info("%s: advisor model %s", m_conf.name, m_conf.advisor)
+
+        built[m_conf.name] = provider
+        logger.info("%s: selected model %s via %s", m_conf.name, m_conf.model, p_conf.name)
 
     if not built:
         logger.error("No LLM providers available")
         sys.exit(1)
 
-    default_p = cfg.llm.default_provider()
-    default_name = default_p.name if default_p and default_p.name in built else next(iter(built))
+    default_model = cfg.llm.default_model()
+    default_name = default_model.name if default_model and default_model.name in built else next(iter(built))
 
     default_llm = built[default_name]
     fallback_chain = [built[n] for n in cfg.llm.fallback if n in built and n != default_name]
@@ -316,36 +325,23 @@ class Memoo:
                 logger.warning("Skipping channel %s: %s", channel_type, e)
 
     def _resolve_compressor(self, preference: str) -> LLMProvider | None:
-        """Resolve a compressor model preference to a dedicated LLM provider instance.
-
-        Accepts bare model names ("haiku") or slash-qualified refs ("anthropic/claude-haiku-4-5").
-        """
-        from core.config import split_model_ref
-        from models import ModelCache
-
-        prov_hint, model_pref = split_model_ref(preference)
-        cache = ModelCache()
-        for p_conf in self.cfg.llm.providers:
-            if p_conf.name not in self._providers:
-                continue
-            if prov_hint and p_conf.provider != prov_hint:
-                continue
-            cached = cache.get(p_conf.provider)
-            if not cached:
-                continue
-            model_id = _pick_model(cached, model_pref)
-            if model_id:
-                try:
-                    api_key = _get_api_key(p_conf.provider)
-                except ValueError:
-                    continue
-                cp_kwargs: dict[str, Any] = {"api_key": api_key}
-                if p_conf.provider == "openai" and p_conf.base_url:
-                    cp_kwargs["base_url"] = p_conf.base_url
-                provider = create_provider(p_conf.provider, **cp_kwargs)
-                provider.model_name = model_id  # type: ignore[union-attr]
-                logger.info("Compressor: %s (from %s)", model_id, p_conf.name)
-                return provider
+        """Resolve a configured compressor alias to a dedicated LLM provider instance."""
+        model_conf = self.cfg.llm.resolve_model(preference)
+        if model_conf:
+            provider_conf = self.cfg.llm.resolve_provider(model_conf.provider)
+            if not provider_conf:
+                logger.warning("Compressor provider '%s' not found", model_conf.provider)
+                return None
+            try:
+                cp_kwargs = _provider_kwargs(provider_conf, model_conf, self.cfg.tools.web_search)
+            except ValueError:
+                return None
+            provider = create_provider(provider_conf.provider, **cp_kwargs)
+            provider.model_name = model_conf.model  # type: ignore[union-attr]
+            if provider_conf.provider == "anthropic" and model_conf.advisor:
+                provider._advisor_model = model_conf.advisor  # type: ignore[union-attr]
+            logger.info("Compressor: %s (from %s)", model_conf.model, model_conf.name)
+            return provider
         logger.warning("Compressor preference '%s' not resolved, using fallback", preference)
         return None
 

@@ -56,7 +56,11 @@ def register(registry: ToolRegistry, **deps: Any) -> None:
 
         logger.info(
             "run_code: lang=%s, backend=%s, session=%s, timeout=%d, len=%d",
-            language, sb.backend, sid, timeout or sb._timeout, len(code),
+            language,
+            sb.backend,
+            sid,
+            timeout or sb._timeout,
+            len(code),
         )
 
         return await sb.exec_code(
