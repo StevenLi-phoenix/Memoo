@@ -1,3 +1,5 @@
+![Memoo banner](./banner.png)
+
 # Memoo
 
 Lightweight personal AI agent bot built on Claude API `tool_use` with OpenAI fallback. A single `Agent` class orchestrates perception–decision–action–reflection cycles, and all messaging platforms flow through one central `handle_message()` entry point.
